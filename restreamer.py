@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-High-Performance Multi-Channel TikTok Restreamer with H.264 Filler NAL Padding.
-Audio: Full AAC Re-encode (44.1kHz, 128k, Stereo) with Async Timestamp Resampling (A/V Sync).
-Video: Stream Copied (-c:v copy) with Paced Filler Padding to 2000 Kbps (Hard Max: 3500 Kbps).
+High-Performance Multi-Channel TikTok Restreamer.
+Platform-Optimized Pipelines:
+- YouTube / Custom: H.264 Copy (-c:v copy) + Filler NAL (2000k target, 3500k ceiling) + AAC re-encode.
+- Facebook / Instagram: Strict Live API Compliance (H.264 720p @ 30fps CFR, Keyframe GOP=2s/60, 2500k, AAC 128k).
 """
 
 import json
@@ -22,7 +23,7 @@ STREAMS_PATH = os.path.join(DATA_DIR, "streams.json")
 CONFIG_PATH = os.path.join(DATA_DIR, "global.json")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-FILLER_KBPS = int(os.environ.get("FILLER_KBPS", 2000))  # الهدف: 2000k
+FILLER_KBPS = int(os.environ.get("FILLER_KBPS", 2000))  # الهدف ليوتيوب: 2000k
 MAX_CAP_KBPS = 3500  # سقف أمان صارم: مستحيل يتجاوز 3500k نهائياً
 
 ACTIVE_PROCESSES = {}  # tiktok_user -> subprocess.Popen
@@ -32,15 +33,13 @@ def log(msg: str):
     print(f"[{ts}] {msg}", flush=True)
 
 # ---------------------------------------------------------------------------
-# محرك حشو البت ريت (H.264 Filler NAL Padding) مع قفل أمان حد أقصى 3500k
+# محرك حشو البت ريت (H.264 Filler NAL Padding) لليوتيوب (سقف 3500k)
 # ---------------------------------------------------------------------------
 
 def run_filler(target_kbps: int, max_cap_kbps: int = 3500) -> None:
     output = sys.stdout.buffer
     input_stream = sys.stdin.buffer
     bytes_per_ms = target_kbps * 1000.0 / 8.0 / 1000.0
-
-    # أقصى حجم مسموح به للإطار الواحد لضمان عدم تجاوز 3500kbps عند 30 فريم (14.5 كيلوبايت)
     MAX_BYTES_PER_FRAME = int((max_cap_kbps * 1000.0 / 8.0) / 30.0)
 
     header = input_stream.read(13)
@@ -176,27 +175,48 @@ def check_is_live(tiktok_url: str) -> bool:
 def stream_worker(stream_data: dict, stop_event: threading.Event):
     user = stream_data["tiktok_user"]
     target = stream_data["target_url"]
-    platform = stream_data["platform"]
+    platform = stream_data.get("platform", "YouTube")
     tiktok_url = f"https://www.tiktok.com/@{user}/live"
 
-    log(f"[{user}] بدء مراقبة الحساب للبث إلى {platform} ({tiktok_url}) مع ترميز الصوت وفلاتر التوقيتات")
+    log(f"[{user}] بدء مراقبة الحساب للبث إلى {platform} ({tiktok_url})")
 
-    # مسار البث: ترميز الصوت AAC + فلاتر ظبط التوقيت ومزامنة الصوت والصورة A/V Sync + فلتر 2000k
-    pipeline_cmd = (
-        f"set -o pipefail; "
-        f"streamlink --stdout --retry-streams 5 --retry-open 5 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
-        f"mbuffer -q -m 8M -P 2 | "
-        f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
-        f"-fflags +genpts+discardcorrupt+nobuffer "
-        f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
-        f"-c:v copy "
-        f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
-        f"-af 'aresample=async=1000:first_pts=0' "
-        f"-avoid_negative_ts make_zero -max_interleave_delta 0 -f flv pipe:1 | "
-        f"python3 restreamer.py --filler {FILLER_KBPS} | "
-        f"ffmpeg -hide_banner -nostdin -loglevel warning "
-        f"-f flv -i pipe:0 -c copy -flvflags no_duration_filesize -f flv {shlex.quote(target)}"
-    )
+    # تخصيص خط الأنابيب حسب المنصة تلقائياً:
+    if platform in ["Facebook", "Instagram"]:
+        # منصات Facebook و Instagram: معايير Live API الصارمة (H.264 High Profile, CFR 30fps, GOP=2s, 2500k, AAC 128k)
+        log(f"[{user}] تطبيق بروفايل Facebook/Instagram Live API الصارم (30fps CFR | GOP 2s | 2500k)")
+        pipeline_cmd = (
+            f"set -o pipefail; "
+            f"streamlink --stdout --retry-streams 5 --retry-open 5 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
+            f"mbuffer -q -m 8M -P 2 | "
+            f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
+            f"-fflags +genpts+discardcorrupt+nobuffer "
+            f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
+            f"-c:v libx264 -preset veryfast -profile:v high -pix_fmt yuv420p "
+            f"-b:v 2500k -minrate 1500k -maxrate 3500k -bufsize 5000k "
+            f"-r 30 -fps_mode cfr -g 60 -keyint_min 60 -sc_threshold 0 "
+            f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
+            f"-af 'aresample=async=1000:first_pts=0' "
+            f"-avoid_negative_ts make_zero -max_interleave_delta 0 "
+            f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
+        )
+    else:
+        # منصة YouTube والروابط المخصصة: النسخ المباشر (-c:v copy) مع فلتر 2000k وسقف 3500k
+        log(f"[{user}] تطبيق بروفايل YouTube (Copy Codec + Filler 2000k | سقف 3500k)")
+        pipeline_cmd = (
+            f"set -o pipefail; "
+            f"streamlink --stdout --retry-streams 5 --retry-open 5 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
+            f"mbuffer -q -m 8M -P 2 | "
+            f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
+            f"-fflags +genpts+discardcorrupt+nobuffer "
+            f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
+            f"-c:v copy "
+            f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
+            f"-af 'aresample=async=1000:first_pts=0' "
+            f"-avoid_negative_ts make_zero -max_interleave_delta 0 -f flv pipe:1 | "
+            f"python3 restreamer.py --filler {FILLER_KBPS} | "
+            f"ffmpeg -hide_banner -nostdin -loglevel warning "
+            f"-f flv -i pipe:0 -c copy -flvflags no_duration_filesize -f flv {shlex.quote(target)}"
+        )
 
     is_currently_live = False
     consecutive_failures = 0
@@ -218,9 +238,9 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
         if not is_currently_live:
             is_currently_live = True
             update_stream_live_status(user, True)
-            notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\nجاري الإرسال المباشر فوراً إلى <b>{platform}</b> مع مزامنة كاملة للصوت 🚀")
+            notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\nجاري الإرسال المباشر فوراً إلى <b>{platform}</b> بإعدادات متوافقة 100% 🚀")
 
-        log(f"[{user}] إطلاق خط الأنابيب (ترميز صوت + مزامنة توقيتات + فلتر 2000k) إلى: {target}")
+        log(f"[{user}] إطلاق خط الأنابيب إلى: {target}")
 
         err_file = f"/tmp/pipeline_err_{user}.log"
         with open(err_file, "w") as ef:
@@ -264,7 +284,7 @@ def main():
         run_filler(int(sys.argv[2]), MAX_CAP_KBPS)
         return
 
-    log(f"محرك إدارة البثوث قيد التشغيل (صوت AAC مشفر + مزامنة + فلتر: {FILLER_KBPS}k)...")
+    log(f"محرك إدارة البثوث قيد التشغيل (يوتيوب: فلتر 2000k وسقف 3500k | فيسبوك وإنستغرام: Live API مشفر)...")
     with open("/tmp/daemon_ready", "w") as f:
         f.write("ok")
 
