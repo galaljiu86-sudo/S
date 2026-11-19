@@ -1,0 +1,171 @@
+name: vps-relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      receive:
+        description: "استقبل الملفات من الجهاز التاني"
+        required: false
+        default: "false"
+  schedule:
+    - cron: '15,35,55 * * * *'
+
+env:
+  MY_NAME: vps-s
+  PEER_NAME: vps-g
+  PEER_REPO: galaljiu86-sudo/G
+  PEER_BRANCH: main
+  WORKFLOW_FILE: run.yml
+  START_CMD: "bash start.sh"
+  HANDOFF_MIN: "280"
+  LAST_MIN: "350"
+  OVERLAP_SEC: "1200"              # ثلث ساعة كاملة (20 دقيقة) تداخل سلس بدون انقطاع
+  READY_WAIT_SEC: "180"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - name: حارس يمنع تكرار التشغيل
+        id: guard
+        if: github.event_name == 'schedule'
+        env:
+          PAT: ${{ secrets.PAT }}
+          GHT: ${{ github.token }}
+        run: |
+          count() {
+            n=$(curl -sf -H "Authorization: Bearer $1" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$2/actions/runs?status=$3&per_page=1" | jq '.total_count // 0' 2>/dev/null)
+            echo "${n:-0}"
+          }
+          me=$(( $(count "$GHT" "${{ github.repository }}" in_progress) + $(count "$GHT" "${{ github.repository }}" queued) ))
+          peer=$(( $(count "$PAT" "$PEER_REPO" in_progress) + $(count "$PAT" "$PEER_REPO" queued) ))
+          echo "me=$me peer=$peer"
+          if [ "$me" -gt 1 ] || [ "$peer" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "سلسلة أخرى نشطة حالياً، سيتم الخروج."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != 'true'
+
+      - name: علّم وقت البداية
+        if: steps.guard.outputs.skip != 'true'
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: تثبيت المتطلبات وأدوات الشبكة
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq netcat-openbsd jq ffmpeg mbuffer > /dev/null
+          pip3 install --no-cache-dir -r requirements.txt
+
+      - name: الاتصال بشبكة Tailscale
+        if: steps.guard.outputs.skip != 'true'
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: ${{ env.MY_NAME }}
+          args: --ssh
+
+      - name: استقبل الملفات من الجهاز السابق
+        if: steps.guard.outputs.skip != 'true' && github.event.inputs.receive == 'true'
+        run: |
+          mkdir -p data
+          echo "بانتظار وصول ملفات الداتا من الرانر القديم..."
+          timeout 180 nc -l 9000 | tar xzf - || echo "لا توجد ملفات سابقة أو أول تشغيل"
+          ls -la data
+
+      - name: تشغيل الخدمة وإعلان الجاهزية
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+          MY_NAME: ${{ env.MY_NAME }}
+        run: |
+          mkdir -p data
+          rm -f /tmp/daemon_ready
+          setsid nohup $START_CMD > out.log 2>&1 &
+
+          ok=0
+          for i in $(seq 1 $(( READY_WAIT_SEC / 2 ))); do
+            if [ -f /tmp/daemon_ready ]; then ok=1; break; fi
+            sleep 2
+          done
+
+          if [ "$ok" = 1 ]; then
+            mkdir -p /tmp/ready && echo ok > /tmp/ready/ready
+            setsid nohup python3 -m http.server 9001 --directory /tmp/ready > /dev/null 2>&1 &
+            echo "✅ الخدمة والبوت يعملان بنجاح، الجهاز جاهز"
+          else
+            echo "❌ فشل بدء الخدمة، تفاصيل out.log:"
+            cat out.log || true
+            exit 1
+          fi
+
+      - name: تسليم الراية للجهاز التالي (Handoff Relay مع تداخل ثلث ساعة)
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          PAT: ${{ secrets.PAT }}
+        run: |
+          elapsed() { echo $(( $(date +%s) - JOB_START )); }
+
+          peer_runs() {
+            for s in in_progress queued; do
+              curl -s -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$PEER_REPO/actions/runs?status=$s&per_page=1" | jq '.total_count // 0'
+            done | awk '{n+=$1} END{print n+0}'
+          }
+
+          dispatch() {
+            curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$PEER_REPO/actions/workflows/$WORKFLOW_FILE/dispatches" \
+              -d "{\"ref\":\"$PEER_BRANCH\",\"inputs\":{\"receive\":\"true\"}}"
+          }
+
+          discover() {
+            sudo tailscale status --json | jq -r --arg n "$PEER_NAME" \
+              '[.Peer[]? | select(.Online==true) | select(.HostName|test("^"+$n+"(-[0-9]+)?$"))] | sort_by(.Created) | last | .TailscaleIPs[0] // empty'
+          }
+
+          wait=$(( HANDOFF_MIN*60 - $(elapsed) ))
+          [ "$wait" -gt 0 ] && sleep "$wait"
+
+          SENT=0; READY=0; LAST_DISPATCH=-9999
+          while [ "$(elapsed)" -lt $(( LAST_MIN*60 )) ]; do
+            IP=$(discover)
+
+            if [ -z "$IP" ]; then
+              SENT=0
+              if [ $(( $(elapsed) - LAST_DISPATCH )) -ge 300 ] && [ "$(peer_runs)" -eq 0 ]; then
+                echo "dispatch -> $(dispatch)"
+                LAST_DISPATCH=$(elapsed)
+              fi
+            fi
+
+            if [ -n "$IP" ] && [ "$SENT" = 0 ]; then
+              if tar czf - data | nc -N -w 30 "$IP" 9000; then SENT=1; echo "تم نقل قاعدة البيانات والإعدادات للجهاز الجديد"; fi
+            fi
+
+            if [ -n "$IP" ] && curl -sf --max-time 5 "http://$IP:9001/ready" > /dev/null; then
+              READY=1; break
+            fi
+            sleep 10
+          done
+
+          if [ "$READY" = 1 ]; then
+            echo "الجهاز التالي بدأ وجاهز. بدء فترة التداخل المتزامن (${OVERLAP_SEC} ثانية / 20 دقيقة)..."
+            sleep "$OVERLAP_SEC"
+            pkill -f "$START_CMD" || true
+            pkill -f "python3 bot.py" || true
+            pkill -f "python3 restreamer.py" || true
+            pkill -x ffmpeg || true
+            echo "تم تسليم العمليات بنجاح بعد انقضاء الـ 20 دقيقة وإيقاف الجهاز الحالي."
+          else
+            echo "تحذير: لم يستجب الجهاز الآخر، سيستمر العمل حتى الحد الأقصى."
+            rest=$(( 356*60 - $(elapsed) ))
+            [ "$rest" -gt 0 ] && sleep "$rest"
+          fi
