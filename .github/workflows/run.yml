@@ -19,7 +19,7 @@ env:
   START_CMD: "bash start.sh"
   HANDOFF_MIN: "280"
   LAST_MIN: "350"
-  OVERLAP_SEC: "1200"              # ثلث ساعة كاملة (20 دقيقة) تداخل سلس بدون انقطاع
+  OVERLAP_SEC: "1200"
   READY_WAIT_SEC: "180"
 
 jobs:
