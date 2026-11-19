@@ -4,6 +4,7 @@
 High-Performance Multi-Channel TikTok Restreamer with H.264 Filler NAL Padding.
 Pads stream bitrate to 2000 - 2500 Kbps without re-encoding (-c:v copy).
 Zero CPU re-encode overhead.
+Stateful anti-spam notifications (Zero duplicate messages).
 """
 
 import json
@@ -75,6 +76,7 @@ def run_filler(target_kbps: int) -> None:
         if len(payload) != data_size or len(prev_tag_size) != 4:
             break
 
+        # معالجة الصوت والفيديو
         if tag_type == 8:  # Audio
             audio_bytes += data_size + 15
         elif tag_type == 9 and data_size > 5:  # Video
@@ -94,6 +96,7 @@ def run_filler(target_kbps: int) -> None:
                 needed = int(carry_bytes) - (data_size + 15) - audio_bytes
                 audio_bytes = 0
 
+                # سقف أقصى لـ carry_bytes حتى لا يقفز البت ريت
                 carry_bytes = min(carry_bytes, bytes_per_ms * 50)
 
                 if needed > 16:
@@ -106,6 +109,7 @@ def run_filler(target_kbps: int) -> None:
                 if carry_bytes < 0:
                     carry_bytes = 0.0
 
+        # كتابة التاج المحدث
         ts = timestamp & 0xFFFFFFFF
         new_header = (
             bytes([tag_type])
@@ -121,7 +125,7 @@ def run_filler(target_kbps: int) -> None:
     output.flush()
 
 # ---------------------------------------------------------------------------
-# إدارة وتشغيل البث المتعدد
+# إدارة البث المتعدد والإشعارات الذكية
 # ---------------------------------------------------------------------------
 
 def notify_telegram(message: str):
@@ -178,33 +182,43 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
 
     log(f"[{user}] بدء مراقبة الحساب للبث إلى {platform} ({tiktok_url}) مع فلتر رفع البت ريت لـ {FILLER_KBPS}k")
 
-    # مسار البث مع فلتر رفع البت ريت لـ 2000k بدون إعادة ترميز
+    # مسار البث مع فلتر رفع البت ريت بدون إعادة ترميز
     pipeline_cmd = (
         f"set -o pipefail; "
-        f"streamlink --stdout --retry-streams 3 --retry-open 3 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
+        f"streamlink --stdout --retry-streams 5 --retry-open 5 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
         f"mbuffer -q -m 8M -P 2 | "
         f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err -fflags +genpts+discardcorrupt "
         f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
         f"-c:v copy -c:a aac -b:a 128k -ar 44100 -af aresample=async=1000 "
         f"-avoid_negative_ts make_zero -max_interleave_delta 0 -f flv pipe:1 | "
         f"python3 restreamer.py --filler {FILLER_KBPS} | "
-        f"ffmpeg -hide_banner -nostdin -loglevel warning -stats -stats_period 15 -progress /tmp/prog_ch1.txt "
+        f"ffmpeg -hide_banner -nostdin -loglevel warning "
         f"-f flv -i pipe:0 -c copy -flvflags no_duration_filesize -f flv {shlex.quote(target)}"
     )
 
-    last_notify_start = 0.0
+    is_currently_live = False
+    consecutive_failures = 0
 
     while not stop_event.is_set():
-        if not check_is_live(tiktok_url):
+        is_live = check_is_live(tiktok_url)
+
+        if not is_live:
+            if is_currently_live:
+                # التأكد مرتين بفارق زمني قبل إعلان انتهاء البث رسمياً لمنع الإشعارات الكاذبة والتكرار
+                stop_event.wait(6)
+                if not check_is_live(tiktok_url):
+                    is_currently_live = False
+                    update_stream_live_status(user, False)
+                    notify_telegram(f"⏹️ <b>انتهى البث المباشر لحساب @{user}.</b>\nتم إيقاف النقل إلى {platform}.")
             update_stream_live_status(user, False)
             stop_event.wait(5)
             continue
 
-        now = time.time()
-        if now - last_notify_start > 60:
+        # الحساب فاتح لايف على تيك توك
+        if not is_currently_live:
+            is_currently_live = True
             update_stream_live_status(user, True)
-            notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\nجاري الإرسال المباشر فوراً إلى <b>{platform}</b> بت ريت {FILLER_KBPS}k 🚀")
-            last_notify_start = now
+            notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\nجاري الإرسال المباشر فوراً إلى <b>{platform}</b> (بت ريت {FILLER_KBPS}k) 🚀")
 
         log(f"[{user}] إطلاق خط الأنابيب (سحب + فلتر بت ريت {FILLER_KBPS}k) إلى: {target}")
 
@@ -224,7 +238,7 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
             ret = proc.poll()
             if ret is not None:
                 duration = time.time() - start_time
-                log(f"[{user}] انتهت العملية بعد {duration:.1f} ثانية كود: {ret}")
+                log(f"[{user}] خط الأنابيب توقف بعد {duration:.1f} ثانية كود: {ret}")
                 break
             time.sleep(2)
 
@@ -236,13 +250,14 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
         ACTIVE_PROCESSES.pop(user, None)
 
         duration = time.time() - start_time
-        if duration > 15:
-            update_stream_live_status(user, False)
-            notify_telegram(f"⏹️ <b>انتهى البث المباشر لحساب @{user}.</b>\nتم إيقاف النقل إلى {platform}.")
-            stop_event.wait(5)
+        if duration < 10:
+            consecutive_failures += 1
+            wait_time = min(consecutive_failures * 5, 30)
+            log(f"[{user}] توقف سريع ({consecutive_failures} مرات)، انتظار {wait_time}s قبل المحاولة...")
+            stop_event.wait(wait_time)
         else:
-            log(f"[{user}] توقفت العملية سريعاً، انتظار 10 ثوان...")
-            stop_event.wait(10)
+            consecutive_failures = 0
+            stop_event.wait(3)
 
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--filler":
