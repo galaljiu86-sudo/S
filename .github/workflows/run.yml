@@ -58,23 +58,50 @@ jobs:
         if: steps.guard.outputs.skip != 'true'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq netcat-openbsd jq ffmpeg mbuffer > /dev/null
+          sudo apt-get install -y -qq jq ffmpeg mbuffer > /dev/null
           pip3 install --no-cache-dir -r requirements.txt
 
-      - name: الاتصال بشبكة Tailscale
+      - name: الاتصال بشبكة Tailscale (دائم لا ينتهي)
         if: steps.guard.outputs.skip != 'true'
         uses: tailscale/github-action@v3
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ secrets.TS_OAUTH_CLIENT_ID != '' && 'tag:ci' || '' }}
           hostname: ${{ env.MY_NAME }}
           args: --ssh
 
-      - name: استقبل الملفات من الجهاز السابق
+      - name: استقبل وتخزين ملفات الداتا من الرانر السابق
         if: steps.guard.outputs.skip != 'true' && github.event.inputs.receive == 'true'
         run: |
           mkdir -p data
           echo "بانتظار وصول ملفات الداتا من الرانر القديم..."
-          timeout 180 nc -l 9000 | tar xzf - || echo "لا توجد ملفات سابقة أو أول تشغيل"
+          python3 -c "
+          import socket, tarfile, io
+          s = socket.socket()
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(('0.0.0.0', 9000))
+          s.listen(1)
+          s.settimeout(180)
+          print('Receiver listening on port 9000...')
+          try:
+              conn, addr = s.accept()
+              buf = bytearray()
+              while True:
+                  chunk = conn.recv(65536)
+                  if not chunk: break
+                  buf.extend(chunk)
+              conn.close()
+              if buf:
+                  tar = tarfile.open(fileobj=io.BytesIO(buf), mode='r:gz')
+                  tar.extractall('.')
+                  print('Data sync complete!')
+          except Exception as e:
+              print(f'Notice: {e}')
+          finally:
+              s.close()
+          " || echo "استمرار..."
           ls -la data
 
       - name: تشغيل الخدمة وإعلان الجاهزية
@@ -147,7 +174,22 @@ jobs:
             fi
 
             if [ -n "$IP" ] && [ "$SENT" = 0 ]; then
-              if tar czf - data | nc -N -w 30 "$IP" 9000; then SENT=1; echo "تم نقل قاعدة البيانات والإعدادات للجهاز الجديد"; fi
+              python3 -c "
+              import socket, tarfile, io, os
+              s = socket.socket()
+              s.settimeout(15)
+              try:
+                  s.connect(('$IP', 9000))
+                  buf = io.BytesIO()
+                  with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+                      if os.path.exists('data'):
+                          tar.add('data')
+                  s.sendall(buf.getvalue())
+                  s.close()
+                  print('SYNC_SUCCESS')
+              except Exception as e:
+                  print(f'SYNC_FAIL: {e}')
+              " | grep -q 'SYNC_SUCCESS' && { SENT=1; echo "✅ تم نقل مجلد data بالكامل للجهاز الجديد بنجاح!"; }
             fi
 
             if [ -n "$IP" ] && curl -sf --max-time 5 "http://$IP:9001/ready" > /dev/null; then
@@ -168,4 +210,20 @@ jobs:
             echo "تحذير: لم يستجب الجهاز الآخر، سيستمر العمل حتى الحد الأقصى."
             rest=$(( 356*60 - $(elapsed) ))
             [ "$rest" -gt 0 ] && sleep "$rest"
+          fi
+
+      - name: حفظ وتخزين بيانات البوت في المستودع احتياطياً
+        if: always() && steps.guard.outputs.skip != 'true'
+        env:
+          PAT: ${{ secrets.PAT }}
+        run: |
+          if [ -d data ] && [ -n "$PAT" ]; then
+            git config --global user.name "bot-sync"
+            git config --global user.email "bot@actions.local"
+            git add data/
+            if ! git diff --cached --quiet; then
+              git commit -m "Auto-backup bot data [skip ci]" || true
+              git push "https://${PAT}@github.com/${{ github.repository }}.git" HEAD:${{ github.ref_name }} || true
+              echo "✅ تم حفظ الداتا في المستودع احتياطياً بنجاح."
+            fi
           fi
