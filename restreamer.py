@@ -80,10 +80,9 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
 
     log(f"[{user}] بدء مراقبة الحساب للبث إلى {platform} ({tiktok_url})")
 
-    # أمر البث المتكامل المباشر (أعلى أداء وسرعة قصوى)
     pipeline_cmd = (
         f"set -o pipefail; "
-        f"streamlink --stdout --retry-streams 3 --retry-max 0 {shlex.quote(tiktok_url)} h264_hd,best | "
+        f"streamlink --stdout --retry-streams 3 --retry-open 3 {shlex.quote(tiktok_url)} h264_hd,best | "
         f"mbuffer -q -m 8M -P 2 | "
         f"ffmpeg -hide_banner -nostdin -loglevel warning -stats -stats_period 15 "
         f"-progress /tmp/prog_ch1.txt -err_detect ignore_err -fflags +genpts+discardcorrupt "
@@ -93,34 +92,42 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
         f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
     )
 
+    last_notify_start = 0.0
+
     while not stop_event.is_set():
         if not check_is_live(tiktok_url):
             update_stream_live_status(user, False)
-            stop_event.wait(4)
+            stop_event.wait(5)
             continue
 
-        # الحساب فاتح لايف الآن!
-        update_stream_live_status(user, True)
-        notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\nجاري الإرسال المباشر فوراً إلى <b>{platform}</b> 🚀")
-        log(f"[{user}] البث المباشر بدأ! جاري إطلاق خط الأنابيب إلى: {target}")
+        now = time.time()
+        if now - last_notify_start > 60:
+            update_stream_live_status(user, True)
+            notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\nجاري الإرسال المباشر فوراً إلى <b>{platform}</b> 🚀")
+            last_notify_start = now
 
-        proc = subprocess.Popen(
-            pipeline_cmd,
-            shell=True,
-            executable="/bin/bash",
-            preexec_fn=os.setsid
-        )
+        log(f"[{user}] إطلاق خط أنابيب البث المباشر فوراً إلى {target}")
+
+        err_file = f"/tmp/pipeline_err_{user}.log"
+        with open(err_file, "w") as ef:
+            proc = subprocess.Popen(
+                pipeline_cmd,
+                shell=True,
+                executable="/bin/bash",
+                stderr=ef,
+                preexec_fn=os.setsid
+            )
         ACTIVE_PROCESSES[user] = proc
+        start_time = time.time()
 
-        # انتظار انتهاء البث
         while not stop_event.is_set():
             ret = proc.poll()
             if ret is not None:
-                log(f"[{user}] انتهى مسار البث كود: {ret}")
+                duration = time.time() - start_time
+                log(f"[{user}] انتهت العملية بعد {duration:.1f} ثانية كود: {ret}")
                 break
             time.sleep(2)
 
-        # تنظيف العملية
         try:
             if proc.poll() is None:
                 os.killpg(os.getpgid(proc.pid), 15)
@@ -128,19 +135,23 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
             pass
         ACTIVE_PROCESSES.pop(user, None)
 
-        update_stream_live_status(user, False)
-        notify_telegram(f"⏹️ <b>انتهى البث المباشر لحساب @{user}.</b>\nتم إيقاف النقل إلى {platform}.")
-        stop_event.wait(4)
+        duration = time.time() - start_time
+        if duration > 15:
+            update_stream_live_status(user, False)
+            notify_telegram(f"⏹️ <b>انتهى البث المباشر لحساب @{user}.</b>\nتم إيقاف النقل إلى {platform}.")
+            stop_event.wait(5)
+        else:
+            log(f"[{user}] توقفت العملية سريعاً، انتظار 10 ثوان...")
+            stop_event.wait(10)
 
 def main():
-    log("محرك إدارة البثوث المتعددة المباشر قيد التشغيل...")
+    log("محرك إدارة البثوث المتعددة قيد التشغيل...")
     with open("/tmp/daemon_ready", "w") as f:
         f.write("ok")
 
-    workers = {}  # user -> dict(thread, stop)
+    workers = {}
 
     while True:
-        # فحص إشارة إعادة التحميل
         if os.path.exists("/tmp/reload_restreamer"):
             try:
                 os.remove("/tmp/reload_restreamer")
@@ -161,7 +172,6 @@ def main():
         configured = load_streams()
         active_users = {s["tiktok_user"]: s for s in configured if s.get("enabled", True)}
 
-        # إيقاف المعطل أو المحذوف
         for u in list(workers.keys()):
             if u not in active_users:
                 log(f"إيقاف مراقبة الحساب: @{u}")
@@ -173,7 +183,6 @@ def main():
                         pass
                 del workers[u]
 
-        # تشغيل أي بث جديد
         for u, sdata in active_users.items():
             if u not in workers or not workers[u]["thread"].is_alive():
                 stop_evt = threading.Event()
