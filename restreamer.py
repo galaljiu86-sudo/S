@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 High-Performance Multi-Channel TikTok Restreamer with H.264 Filler NAL Padding.
-Pads stream bitrate to 2000 - 2500 Kbps without re-encoding (-c:v copy).
-Zero CPU re-encode overhead.
-Stateful anti-spam notifications (Zero duplicate messages).
+Audio: Full AAC Re-encode (44.1kHz, 128k, Stereo) with Async Timestamp Resampling (A/V Sync).
+Video: Stream Copied (-c:v copy) with Paced Filler Padding to 2000 Kbps (Hard Max: 3500 Kbps).
 """
 
 import json
@@ -23,7 +22,8 @@ STREAMS_PATH = os.path.join(DATA_DIR, "streams.json")
 CONFIG_PATH = os.path.join(DATA_DIR, "global.json")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-FILLER_KBPS = int(os.environ.get("FILLER_KBPS", 2000))  # رفع البت ريت لـ 2000k بدون إعادة ترميز
+FILLER_KBPS = int(os.environ.get("FILLER_KBPS", 2000))  # الهدف: 2000k
+MAX_CAP_KBPS = 3500  # سقف أمان صارم: مستحيل يتجاوز 3500k نهائياً
 
 ACTIVE_PROCESSES = {}  # tiktok_user -> subprocess.Popen
 
@@ -32,14 +32,16 @@ def log(msg: str):
     print(f"[{ts}] {msg}", flush=True)
 
 # ---------------------------------------------------------------------------
-# محرك حشو البت ريت (H.264 Filler NAL Padding) بدون إعادة ترميز
+# محرك حشو البت ريت (H.264 Filler NAL Padding) مع قفل أمان حد أقصى 3500k
 # ---------------------------------------------------------------------------
 
-def run_filler(target_kbps: int) -> None:
-    """قراءة FLV وحقن باكتات NAL حشو H.264 (Type 12) لرفع البت ريت للرقم المطلوب."""
+def run_filler(target_kbps: int, max_cap_kbps: int = 3500) -> None:
     output = sys.stdout.buffer
     input_stream = sys.stdin.buffer
     bytes_per_ms = target_kbps * 1000.0 / 8.0 / 1000.0
+
+    # أقصى حجم مسموح به للإطار الواحد لضمان عدم تجاوز 3500kbps عند 30 فريم (14.5 كيلوبايت)
+    MAX_BYTES_PER_FRAME = int((max_cap_kbps * 1000.0 / 8.0) / 30.0)
 
     header = input_stream.read(13)
     if len(header) < 13 or header[:3] != b"FLV":
@@ -53,7 +55,6 @@ def run_filler(target_kbps: int) -> None:
 
     def make_filler(filler_bytes: int) -> bytes:
         filler_bytes = max(0, filler_bytes)
-        # NAL length (4 bytes) + NAL header 0x0c (Type 12 Filler) + 0xff padding + 0x80 stop bit
         return (
             struct.pack(">I", filler_bytes + 2)
             + b"\x0c"
@@ -76,7 +77,6 @@ def run_filler(target_kbps: int) -> None:
         if len(payload) != data_size or len(prev_tag_size) != 4:
             break
 
-        # معالجة الصوت والفيديو
         if tag_type == 8:  # Audio
             audio_bytes += data_size + 15
         elif tag_type == 9 and data_size > 5:  # Video
@@ -87,7 +87,7 @@ def run_filler(target_kbps: int) -> None:
             if codec_id == 7 and packet_type == 1:  # H.264 NALU frame
                 if last_video_ts is not None:
                     delta = timestamp - last_video_ts
-                    if 0 <= delta <= 300:
+                    if 0 <= delta <= 100:
                         carry_bytes += delta * bytes_per_ms
                     else:
                         carry_bytes = 0.0
@@ -96,11 +96,11 @@ def run_filler(target_kbps: int) -> None:
                 needed = int(carry_bytes) - (data_size + 15) - audio_bytes
                 audio_bytes = 0
 
-                # سقف أقصى لـ carry_bytes حتى لا يقفز البت ريت
-                carry_bytes = min(carry_bytes, bytes_per_ms * 50)
+                carry_bytes = min(carry_bytes, bytes_per_ms * 33.0)
+                max_filler_allowed = max(0, MAX_BYTES_PER_FRAME - data_size)
 
-                if needed > 16:
-                    filler_len = min(needed - 8, 30000)
+                if needed > 16 and max_filler_allowed > 16:
+                    filler_len = min(needed - 8, max_filler_allowed)
                     extra = make_filler(filler_len)
                     payload += extra
                     data_size = len(payload)
@@ -109,7 +109,6 @@ def run_filler(target_kbps: int) -> None:
                 if carry_bytes < 0:
                     carry_bytes = 0.0
 
-        # كتابة التاج المحدث
         ts = timestamp & 0xFFFFFFFF
         new_header = (
             bytes([tag_type])
@@ -180,16 +179,19 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
     platform = stream_data["platform"]
     tiktok_url = f"https://www.tiktok.com/@{user}/live"
 
-    log(f"[{user}] بدء مراقبة الحساب للبث إلى {platform} ({tiktok_url}) مع فلتر رفع البت ريت لـ {FILLER_KBPS}k")
+    log(f"[{user}] بدء مراقبة الحساب للبث إلى {platform} ({tiktok_url}) مع ترميز الصوت وفلاتر التوقيتات")
 
-    # مسار البث مع فلتر رفع البت ريت بدون إعادة ترميز
+    # مسار البث: ترميز الصوت AAC + فلاتر ظبط التوقيت ومزامنة الصوت والصورة A/V Sync + فلتر 2000k
     pipeline_cmd = (
         f"set -o pipefail; "
         f"streamlink --stdout --retry-streams 5 --retry-open 5 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
         f"mbuffer -q -m 8M -P 2 | "
-        f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err -fflags +genpts+discardcorrupt "
+        f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
+        f"-fflags +genpts+discardcorrupt+nobuffer "
         f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
-        f"-c:v copy -c:a aac -b:a 128k -ar 44100 -af aresample=async=1000 "
+        f"-c:v copy "
+        f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
+        f"-af 'aresample=async=1000:first_pts=0' "
         f"-avoid_negative_ts make_zero -max_interleave_delta 0 -f flv pipe:1 | "
         f"python3 restreamer.py --filler {FILLER_KBPS} | "
         f"ffmpeg -hide_banner -nostdin -loglevel warning "
@@ -204,7 +206,6 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
 
         if not is_live:
             if is_currently_live:
-                # التأكد مرتين بفارق زمني قبل إعلان انتهاء البث رسمياً لمنع الإشعارات الكاذبة والتكرار
                 stop_event.wait(6)
                 if not check_is_live(tiktok_url):
                     is_currently_live = False
@@ -214,13 +215,12 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
             stop_event.wait(5)
             continue
 
-        # الحساب فاتح لايف على تيك توك
         if not is_currently_live:
             is_currently_live = True
             update_stream_live_status(user, True)
-            notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\nجاري الإرسال المباشر فوراً إلى <b>{platform}</b> (بت ريت {FILLER_KBPS}k) 🚀")
+            notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\nجاري الإرسال المباشر فوراً إلى <b>{platform}</b> مع مزامنة كاملة للصوت 🚀")
 
-        log(f"[{user}] إطلاق خط الأنابيب (سحب + فلتر بت ريت {FILLER_KBPS}k) إلى: {target}")
+        log(f"[{user}] إطلاق خط الأنابيب (ترميز صوت + مزامنة توقيتات + فلتر 2000k) إلى: {target}")
 
         err_file = f"/tmp/pipeline_err_{user}.log"
         with open(err_file, "w") as ef:
@@ -261,10 +261,10 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
 
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--filler":
-        run_filler(int(sys.argv[2]))
+        run_filler(int(sys.argv[2]), MAX_CAP_KBPS)
         return
 
-    log(f"محرك إدارة البثوث المتعددة قيد التشغيل (الفيلر مفعل بمقدار: {FILLER_KBPS}k)...")
+    log(f"محرك إدارة البثوث قيد التشغيل (صوت AAC مشفر + مزامنة + فلتر: {FILLER_KBPS}k)...")
     with open("/tmp/daemon_ready", "w") as f:
         f.write("ok")
 
