@@ -3,7 +3,12 @@
 """
 Multi-Stream Management & Monitoring Telegram Bot
 Auth: Via Admin Telegram Username (No password required)
-Features: Granular stream control (Pause/Resume/Delete), Server capacity & stats, Live logs viewer.
+Features:
+- Granular stream control (Pause/Resume/Delete).
+- Real-time live upload & download speed + Total data transfer.
+- Server capacity & stats.
+- Live logs viewer.
+- Anti-duplicate messaging.
 """
 
 import json
@@ -51,7 +56,6 @@ def load_streams() -> list:
 def save_streams(streams: list):
     with open(STREAMS_PATH, "w", encoding="utf-8") as f:
         json.dump(streams, f, indent=2, ensure_ascii=False)
-    # إشعار الريستريمر بالتحديث
     with open("/tmp/reload_restreamer", "w") as f:
         f.write(str(time.time()))
 
@@ -67,14 +71,14 @@ def main_keyboard():
         types.KeyboardButton("➕ إضافة بث جديد"),
         types.KeyboardButton("📋 قائمة وإدارة البثوث"),
         types.KeyboardButton("📊 إحصائيات البثوث"),
-        types.KeyboardButton("📜 سجل التشغيل (Logs)"),
-        types.KeyboardButton("📈 استهلاك السيرفر والموارد"),
+        types.KeyboardButton("📈 استهلاك وسرعة السيرفر"),
         types.KeyboardButton("💡 سعة وتحمل السيرفر"),
+        types.KeyboardButton("📜 سجل التشغيل (Logs)"),
         types.KeyboardButton("🔄 إعادة تشغيل البثوث")
     )
     return markup
 
-# --- الأوامر الرئيسية ---
+# --- معالجة الأوامر ---
 
 @bot.message_handler(commands=['start'])
 def handle_start(message):
@@ -87,7 +91,7 @@ def handle_start(message):
         message.chat.id,
         f"👋 مرحباً بك يا @{message.from_user.username} في لوحة التحكم!\n"
         f"🖥️ السيرفر النشط الآن: <code>{MY_NAME}</code>\n\n"
-        f"اختر من الأزرار بالأسفل لإدارة البثوث والسيرفر:",
+        f"اختر من الأزرار بالأسفل لإدارة البثوث ومتابعة السرعة اللحظية:",
         reply_markup=main_keyboard()
     )
 
@@ -122,7 +126,64 @@ def handle_text(message):
         bot.send_message(chat_id, res, reply_markup=main_keyboard())
         return
 
-    # 2. سجل التشغيل والأخطاء (Logs)
+    # 2. استهلاك وسرعة السيرفر الفعلية اللحظية + الإجمالي
+    elif text == "📈 استهلاك وسرعة السيرفر":
+        # أخذ عينة لمدة ثانية واحدة لحساب السرعة اللحظية الفعلية بدقة
+        net_start = psutil.net_io_counters()
+        cpu = psutil.cpu_percent(interval=1.0)
+        net_end = psutil.net_io_counters()
+        ram = psutil.virtual_memory()
+
+        # حساب السرعة اللحظية الحالية (كيلوبايت/ثانية و ميجابت/ثانية)
+        up_speed_kb = (net_end.bytes_sent - net_start.bytes_sent) / 1024.0
+        down_speed_kb = (net_end.bytes_recv - net_start.bytes_recv) / 1024.0
+        up_speed_mbps = (up_speed_kb * 8.0) / 1000.0
+        down_speed_mbps = (down_speed_kb * 8.0) / 1000.0
+
+        # إجمالي حركة البيانات منذ بداية تشغيل السيرفر
+        total_sent_mb = net_end.bytes_sent / (1024 * 1024)
+        total_recv_mb = net_end.bytes_recv / (1024 * 1024)
+
+        uptime_sec = int(time.time() - psutil.boot_time())
+        hours = uptime_sec // 3600
+        minutes = (uptime_sec % 3600) // 60
+
+        res = (
+            f"<b>📈 استهلاك وسرعة السيرفر (<code>{MY_NAME}</code>):</b>\n\n"
+            f"⚙️ <b>المعالج (CPU):</b> {cpu}%\n"
+            f"🧠 <b>الرام (RAM):</b> {ram.percent}% (مستخدم {ram.used // (1024*1024)}MB من أصل {ram.total // (1024*1024)}MB)\n\n"
+            f"🚀 <b>السرعة اللحظية الفعلية (Live Speed):</b>\n"
+            f"   ⬆️ <b>سرعة الرفع:</b> <code>{up_speed_mbps:.2f} Mbps</code> ({up_speed_kb:.1f} KB/s)\n"
+            f"   ⬇️ <b>سرعة التحميل:</b> <code>{down_speed_mbps:.2f} Mbps</code> ({down_speed_kb:.1f} KB/s)\n\n"
+            f"🌐 <b>إجمالي استهلاك البيانات (Total Transfer):</b>\n"
+            f"   ⬆️ رفع: {total_sent_mb:.1f} MB\n"
+            f"   ⬇️ تحميل: {total_recv_mb:.1f} MB\n\n"
+            f"⏱️ <b>مدة عمل السيرفر:</b> {hours} ساعة و {minutes} دقيقة\n"
+        )
+        bot.send_message(chat_id, res, reply_markup=main_keyboard())
+        return
+
+    # 3. سعة وتحمل السيرفر
+    elif text == "💡 سعة وتحمل السيرفر":
+        ram = psutil.virtual_memory()
+        free_ram_mb = ram.available // (1024 * 1024)
+        streams = load_streams()
+        current_streams = len(streams)
+        estimated_more = free_ram_mb // 200
+
+        res = (
+            f"<b>💡 تقرير قدرة وتحمل السيرفر (<code>{MY_NAME}</code>):</b>\n\n"
+            f"🖥️ <b>المواصفات:</b> 2 vCPUs | 7 GB RAM | 1Gbps Network\n"
+            f"📊 <b>البثوث الحالية:</b> {current_streams} بثوث\n"
+            f"🧠 <b>الرام المتبقية الحرة:</b> {free_ram_mb} MB\n\n"
+            f"🚀 <b>السعة التقديرية:</b>\n"
+            f"بما أن الفيديو يتم نسخه مباشرة بدون إعادة ترميز (Copy Codec)، يستهلك كل بث 180MB رام فقط و ~1% معالج.\n\n"
+            f"✅ <b>يمكنك إضافة حتى {estimated_more} بثوث إضافية</b> بأمان تام (السيرفر يتحمل إجمالاً من 15 إلى 25 بث متزامن)!"
+        )
+        bot.send_message(chat_id, res, reply_markup=main_keyboard())
+        return
+
+    # 4. سجل التشغيل (Logs)
     elif text == "📜 سجل التشغيل (Logs)":
         if os.path.exists(RESTREAMER_LOG):
             try:
@@ -140,47 +201,6 @@ def handle_text(message):
             bot.send_message(chat_id, "ℹ️ ملف السجل غير موجود حالياً.", reply_markup=main_keyboard())
         return
 
-    # 3. استهلاك السيرفر والموارد
-    elif text == "📈 استهلاك السيرفر والموارد":
-        cpu = psutil.cpu_percent(interval=0.5)
-        ram = psutil.virtual_memory()
-        net = psutil.net_io_counters()
-        uptime_sec = int(time.time() - psutil.boot_time())
-        hours = uptime_sec // 3600
-        minutes = (uptime_sec % 3600) // 60
-
-        res = (
-            f"<b>📈 استهلاك موارد السيرفر (<code>{MY_NAME}</code>):</b>\n\n"
-            f"⚙️ <b>المعالج (CPU):</b> {cpu}%\n"
-            f"🧠 <b>الرام (RAM):</b> {ram.percent}% (مستخدم {ram.used // (1024*1024)}MB من أصل {ram.total // (1024*1024)}MB)\n"
-            f"🌐 <b>استهلاك الشبكة:</b>\n"
-            f"   ⬆️ رفع: {net.bytes_sent / (1024*1024):.1f} MB\n"
-            f"   ⬇️ تحميل: {net.bytes_recv / (1024*1024):.1f} MB\n"
-            f"⏱️ <b>مدة العمل:</b> {hours} ساعة و {minutes} دقيقة\n"
-        )
-        bot.send_message(chat_id, res, reply_markup=main_keyboard())
-        return
-
-    # 4. سعة وتحمل السيرفر
-    elif text == "💡 سعة وتحمل السيرفر":
-        ram = psutil.virtual_memory()
-        free_ram_mb = ram.available // (1024 * 1024)
-        streams = load_streams()
-        current_streams = len(streams)
-        estimated_more = free_ram_mb // 200
-
-        res = (
-            f"<b>💡 تقرير قدرة وتحمل السيرفر (<code>{MY_NAME}</code>):</b>\n\n"
-            f"🖥️ <b>المواصفات:</b> 2 vCPUs | 7 GB RAM | 1Gbps Network\n"
-            f"📊 <b>البثوث الحالية:</b> {current_streams} بثوث\n"
-            f"🧠 <b>الرام المتبقية الحرة:</b> {free_ram_mb} MB\n\n"
-            f"🚀 <b>السعة التقديرية:</b>\n"
-            f"بما أن الفيديو يتم نسخه مباشرة بدون إعادة ترميز (Copy Codec)، يستهلك كل بث 180MB رام فقط و ~1% معالج.\n\n"
-            f"✅ <b>يمكنك إضافة حتى {estimated_more} بثوث إضافية</b> فوق البثوث الحالية بأمان تام (السيرفر يتحمل إجمالاً من 15 إلى 25 بث متزامن)!"
-        )
-        bot.send_message(chat_id, res, reply_markup=main_keyboard())
-        return
-
     # 5. قائمة وإدارة البثوث (تشغيل / إيقاف / حذف)
     elif text == "📋 قائمة وإدارة البثوث":
         streams = load_streams()
@@ -195,7 +215,7 @@ def handle_text(message):
             elif s.get("is_live"):
                 status_txt = "🔴 لايف شغال حالياً"
             else:
-                status_txt = "⚪ في الانتظار (أوفلاين أو جاري الفحص)"
+                status_txt = "⚪ في الانتظار (أوفلاين)"
 
             key_preview = s['stream_key'][:6] + "..." if s.get('stream_key') else "مخصص"
             msg = (
@@ -223,175 +243,129 @@ def handle_text(message):
         USER_STATES[chat_id] = {"step": "AWAIT_TIKTOK_USER"}
         bot.send_message(
             chat_id,
-            "📌 <b>أرسل اسم حساب تيك توك:</b>\n(مثال: <code>d.shakertawfiqalaroury</code> أو رابط الحساب)",
+            "📌 <b>أرسل اسم حساب تيك توك:</b>\n(مثال: <code>c.ahmed.h</code> أو رابط الحساب)",
             reply_markup=types.ReplyKeyboardRemove()
         )
         return
 
     # معالجة خطوات الإضافة (Wizard)
     if state == "AWAIT_TIKTOK_USER":
-        match = re.search(r"tiktok\.com/@([^/?#]+)", text)
-        username = match.group(1) if match else text.lstrip("@").strip()
-
-        USER_STATES[chat_id] = {
-            "step": "CHOOSE_PLATFORM",
-            "tiktok_user": username
-        }
-
-        markup = types.InlineKeyboardMarkup(row_width=2)
+        user_val = text.replace("https://www.tiktok.com/@", "").replace("https://tiktok.com/@", "").lstrip("@").split("/")[0].strip()
+        USER_STATES[chat_id] = {"step": "AWAIT_PLATFORM", "tiktok_user": user_val}
+        
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
         markup.add(
-            types.InlineKeyboardButton("🔵 Facebook Live", callback_data="plat_fb"),
-            types.InlineKeyboardButton("🟣 Instagram Live", callback_data="plat_ig"),
-            types.InlineKeyboardButton("🔴 YouTube Live", callback_data="plat_yt"),
-            types.InlineKeyboardButton("🌐 Custom RTMP", callback_data="plat_custom")
+            types.KeyboardButton("YouTube"),
+            types.KeyboardButton("Facebook"),
+            types.KeyboardButton("Instagram"),
+            types.KeyboardButton("Custom RTMP")
         )
-        bot.send_message(
-            chat_id,
-            f"تم تحديد الحساب: <b>@{username}</b>\n\nاختر المنصة المستهدفة للبث:",
-            reply_markup=markup
-        )
+        bot.send_message(chat_id, f"✅ تم حفظ الحساب: <b>@{user_val}</b>\nاختر المنصة المراد الإرسال إليها:", reply_markup=markup)
+        return
+
+    elif state == "AWAIT_PLATFORM":
+        platform = text
+        USER_STATES[chat_id]["platform"] = platform
+        USER_STATES[chat_id]["step"] = "AWAIT_STREAM_KEY"
+        
+        if platform == "Custom RTMP":
+            bot.send_message(
+                chat_id,
+                "🔗 أرسل رابط الـ RTMP الكامل مع المفتاح:\n(مثال: <code>rtmp://live.twitch.tv/app/live_xyz</code>)",
+                reply_markup=types.ReplyKeyboardRemove()
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                f"🔑 أرسل <b>مفتاح البث (Stream Key)</b> الخاص بـ {platform}:",
+                reply_markup=types.ReplyKeyboardRemove()
+            )
         return
 
     elif state == "AWAIT_STREAM_KEY":
-        data = USER_STATES[chat_id]
-        stream_key = text.strip()
-        server_url = data["server_url"]
-        target_url = f"{server_url.rstrip('/')}/{stream_key.lstrip('/')}"
+        data = USER_STATES.pop(chat_id, {})
+        platform = data.get("platform", "YouTube")
+        key = text
+
+        if platform == "YouTube":
+            target = f"rtmp://a.rtmp.youtube.com/live2/{key}"
+        elif platform == "Facebook":
+            target = f"rtmps://live-api-s.facebook.com:443/rtmp/{key}"
+        elif platform == "Instagram":
+            target = f"rtmps://live-upload.instagram.com:443/rtmp/{key}"
+        else:
+            target = key
 
         streams = load_streams()
         streams.append({
             "tiktok_user": data["tiktok_user"],
-            "platform": data["platform"],
-            "server_url": server_url,
-            "stream_key": stream_key,
-            "target_url": target_url,
+            "platform": platform,
+            "stream_key": key if platform != "Custom RTMP" else "",
+            "target_url": target,
             "enabled": True,
             "is_live": False
         })
         save_streams(streams)
-        USER_STATES.pop(chat_id, None)
 
         bot.send_message(
             chat_id,
-            f"🎉 <b>تم حفظ البث وبدء مراقبته بنجاح!</b>\n\n"
-            f"• <b>تيك توك:</b> <code>@{data['tiktok_user']}</code>\n"
+            f"🎉 <b>تمت إضافة البث وتفعيله بنجاح!</b>\n\n"
+            f"• <b>حساب تيك توك:</b> @{data['tiktok_user']}\n"
             f"• <b>المنصة:</b> {data['platform']}\n"
-            f"• سيصلك إشعار فوري لحظة التقاط إشارة البث المباشر.",
+            f"• سيصلك إشعار فوري لحظة فتح البث.",
             reply_markup=main_keyboard()
         )
         return
 
-    elif state == "AWAIT_CUSTOM_URL":
-        target_url = text.strip()
-        data = USER_STATES[chat_id]
-        streams = load_streams()
-        streams.append({
-            "tiktok_user": data["tiktok_user"],
-            "platform": "Custom RTMP",
-            "server_url": target_url,
-            "stream_key": "",
-            "target_url": target_url,
-            "enabled": True,
-            "is_live": False
-        })
-        save_streams(streams)
-        USER_STATES.pop(chat_id, None)
-
-        bot.send_message(
-            chat_id,
-            f"🎉 تم حفظ الرابط المخصص بنجاح:\n<code>{target_url}</code>",
-            reply_markup=main_keyboard()
-        )
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call):
+    if not is_admin(call.from_user):
+        bot.answer_callback_query(call.id, "⛔ ليس لديك صلاحية.")
         return
 
-# --- Callbacks ---
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("plat_"))
-def handle_plat(call):
-    chat_id = call.message.chat.id
-    code = call.data.split("_")[1]
-
-    if chat_id not in USER_STATES:
-        bot.send_message(chat_id, "انتهت الجلسة، ابدأ من جديد بالضغط على إضافة بث.")
-        return
-
-    if code == "fb":
-        USER_STATES[chat_id].update({
-            "step": "AWAIT_STREAM_KEY",
-            "platform": "Facebook",
-            "server_url": "rtmps://live-api-s.facebook.com:443/rtmp/"
-        })
-        bot.edit_message_text(
-            "🔵 <b>تم اختيار Facebook Live</b>\n"
-            "الرابط الافتراضي: <code>rtmps://live-api-s.facebook.com:443/rtmp/</code>\n\n"
-            "🔑 أرسل الآن <b>مفتاح البث (Stream Key)</b> الخاص بفيسبوك:",
-            chat_id, call.message.message_id
-        )
-    elif code == "ig":
-        USER_STATES[chat_id].update({
-            "step": "AWAIT_STREAM_KEY",
-            "platform": "Instagram",
-            "server_url": "rtmps://edgetee-upload-hbe1-2.xx.fbcdn.net:443/rtmp/"
-        })
-        bot.edit_message_text(
-            "🟣 <b>تم اختيار Instagram Live</b>\n"
-            "الرابط الافتراضي: <code>rtmps://edgetee-upload-hbe1-2.xx.fbcdn.net:443/rtmp/</code>\n\n"
-            "🔑 أرسل الآن <b>مفتاح البث الدائم (Permanent Stream Key)</b>:",
-            chat_id, call.message.message_id
-        )
-    elif code == "yt":
-        USER_STATES[chat_id].update({
-            "step": "AWAIT_STREAM_KEY",
-            "platform": "YouTube",
-            "server_url": "rtmp://a.rtmp.youtube.com/live2/"
-        })
-        bot.edit_message_text(
-            "🔴 <b>تم اختيار YouTube Live</b>\n"
-            "الرابط الافتراضي: <code>rtmp://a.rtmp.youtube.com/live2/</code>\n\n"
-            "🔑 أرسل الآن <b>مفتاح البث (Stream Key)</b> الخاص بيوتيوب:",
-            chat_id, call.message.message_id
-        )
-    elif code == "custom":
-        USER_STATES[chat_id].update({"step": "AWAIT_CUSTOM_URL", "platform": "Custom RTMP"})
-        bot.edit_message_text(
-            "🌐 أرسل الآن رابط RTMP كاملاً مع المفتاح:",
-            chat_id, call.message.message_id
-        )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("pause_"))
-def handle_pause(call):
-    idx = int(call.data.split("_")[1])
+    data = call.data
     streams = load_streams()
-    if 0 <= idx < len(streams):
-        streams[idx]["enabled"] = False
-        save_streams(streams)
-        bot.answer_callback_query(call.id, "⏸️ تم إيقاف البث مؤقتاً")
-        bot.edit_message_text(f"⏸️ تم إيقاف بث @{streams[idx]['tiktok_user']} مؤقتاً.", call.message.chat.id, call.message.message_id)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("resume_"))
-def handle_resume(call):
-    idx = int(call.data.split("_")[1])
-    streams = load_streams()
-    if 0 <= idx < len(streams):
-        streams[idx]["enabled"] = True
-        save_streams(streams)
-        bot.answer_callback_query(call.id, "▶️ تم استئناف تشغيل البث")
-        bot.edit_message_text(f"▶️ تم تفعيل وتشغيل بث @{streams[idx]['tiktok_user']}.", call.message.chat.id, call.message.message_id)
+    if data.startswith("pause_"):
+        idx = int(data.split("_")[1])
+        if idx < len(streams):
+            streams[idx]["enabled"] = False
+            save_streams(streams)
+            bot.answer_callback_query(call.id, f"تم إيقاف @{streams[idx]['tiktok_user']} مؤقتاً")
+            bot.edit_message_text(
+                f"⏸️ <b>تم إيقاف البث لحساب @{streams[idx]['tiktok_user']} مؤقتاً.</b>",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("del_"))
-def handle_delete(call):
-    idx = int(call.data.split("_")[1])
-    streams = load_streams()
-    if 0 <= idx < len(streams):
-        deleted = streams.pop(idx)
-        save_streams(streams)
-        bot.answer_callback_query(call.id, "🗑️ تم الحذف بنجاح!")
-        bot.edit_message_text(f"🗑️ تم حذف بث حساب: @{deleted['tiktok_user']}", call.message.chat.id, call.message.message_id)
+    elif data.startswith("resume_"):
+        idx = int(data.split("_")[1])
+        if idx < len(streams):
+            streams[idx]["enabled"] = True
+            save_streams(streams)
+            bot.answer_callback_query(call.id, f"تم استئناف @{streams[idx]['tiktok_user']}")
+            bot.edit_message_text(
+                f"▶️ <b>تم استئناف وتشغيل البث لحساب @{streams[idx]['tiktok_user']}.</b>",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
+
+    elif data.startswith("del_"):
+        idx = int(data.split("_")[1])
+        if idx < len(streams):
+            removed = streams.pop(idx)
+            save_streams(streams)
+            bot.answer_callback_query(call.id, "تم الحذف")
+            bot.edit_message_text(
+                f"🗑️ <b>تم حذف البث الخاص بـ @{removed['tiktok_user']} نهائياً.</b>",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
 
 if __name__ == "__main__":
-    print(f"[BOT] Starting Telegram Bot on {MY_NAME}...", flush=True)
+    print(f"[{MY_NAME}] Bot daemon starting...", flush=True)
     while True:
         try:
-            bot.infinity_polling(timeout=10, long_polling_timeout=5)
-        except Exception:
+            bot.polling(none_stop=True, timeout=20, long_polling_timeout=20)
+        except Exception as e:
             time.sleep(3)
