@@ -3,17 +3,16 @@
 """
 High-Performance Multi-Channel TikTok Restreamer.
 Features:
-- YouTube: Pure H.264 (Dr. Shaker standards), 48MB buffer, filler 2000k/3500k, aresample sync.
-- Facebook & Instagram: Strict Meta Live API Compliance (2500k CBR, 30fps CFR, Keyframe GOP=2s, AAC 128k, 720x1280).
-- Graceful Hot-Reload: Modifying/adding/deleting a stream NEVER interrupts running streams on ANY platform!
-- Multi-check 45s verification to eliminate false stream endings during TikTok co-host/battle transitions.
+- Facebook & Instagram (Meta): Strict 2500k CBR, 30fps CFR (fps=30 filter), 2s keyframes, 128k AAC audio.
+- YouTube Live: Dr. Shaker verified direct copy (0% CPU) OR ultra-stable 30fps/2500k for static/low-motion screens.
+- Zero-Downtime Hot-Reload: Modifying, adding, or removing one stream NEVER interrupts running streams.
+- Multi-Stage Verification: 45s smart check prevents false ends during TikTok battles/guest co-hosts.
+- Smart Crash Backoff: Prevents network choking & rate limits if a single stream experiences repeated errors.
 """
 
 import json
 import os
-import queue
 import shlex
-import struct
 import subprocess
 import sys
 import threading
@@ -25,108 +24,11 @@ STREAMS_PATH = os.path.join(DATA_DIR, "streams.json")
 CONFIG_PATH = os.path.join(DATA_DIR, "global.json")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-FILLER_KBPS = int(os.environ.get("FILLER_KBPS", 2000))
-MAX_CAP_KBPS = 3500  # سقف أمان صارم لليوتيوب
-
 ACTIVE_PROCESSES = {}  # tiktok_user -> subprocess.Popen
 
 def log(msg: str):
     ts = time.strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{ts}] {msg}", flush=True)
-
-# ---------------------------------------------------------------------------
-# محرك حشو البت ريت (H.264 Filler NAL Padding) لليوتيوب
-# ---------------------------------------------------------------------------
-
-def run_filler(target_kbps: int, max_cap_kbps: int = 3500) -> None:
-    output = sys.stdout.buffer
-    input_stream = sys.stdin.buffer
-    bytes_per_ms = target_kbps * 1000.0 / 8.0 / 1000.0
-    MAX_BYTES_PER_FRAME = int((max_cap_kbps * 1000.0 / 8.0) / 30.0)
-
-    header = input_stream.read(13)
-    if len(header) < 13 or header[:3] != b"FLV":
-        return
-    output.write(header)
-    output.flush()
-
-    carry_bytes = 0.0
-    last_video_ts = None
-    audio_bytes = 0
-
-    def make_filler(filler_bytes: int) -> bytes:
-        filler_bytes = max(0, filler_bytes)
-        return (
-            struct.pack(">I", filler_bytes + 2)
-            + b"\x0c"
-            + (b"\xff" * filler_bytes)
-            + b"\x80"
-        )
-
-    while True:
-        tag_header = input_stream.read(11)
-        if len(tag_header) < 11:
-            break
-
-        tag_type = tag_header[0]
-        data_size = int.from_bytes(tag_header[1:4], "big")
-        timestamp = int.from_bytes(tag_header[4:7], "big") | (tag_header[7] << 24)
-        stream_id = tag_header[8:11]
-
-        payload = input_stream.read(data_size)
-        prev_tag_size = input_stream.read(4)
-        if len(payload) != data_size or len(prev_tag_size) != 4:
-            break
-
-        if tag_type == 8:  # Audio
-            audio_bytes += data_size + 15
-        elif tag_type == 9 and data_size > 5:  # Video
-            first = payload[0]
-            codec_id = first & 0x0F
-            packet_type = payload[1]
-
-            if codec_id == 7 and packet_type == 1:  # H.264 NALU frame
-                if last_video_ts is not None:
-                    delta = timestamp - last_video_ts
-                    if 0 <= delta <= 100:
-                        carry_bytes += delta * bytes_per_ms
-                    else:
-                        carry_bytes = 0.0
-                last_video_ts = timestamp
-
-                needed = int(carry_bytes) - (data_size + 15) - audio_bytes
-                audio_bytes = 0
-
-                carry_bytes = min(carry_bytes, bytes_per_ms * 33.0)
-                max_filler_allowed = max(0, MAX_BYTES_PER_FRAME - data_size)
-
-                if needed > 16 and max_filler_allowed > 16:
-                    filler_len = min(needed - 8, max_filler_allowed)
-                    extra = make_filler(filler_len)
-                    payload += extra
-                    data_size = len(payload)
-
-                carry_bytes -= data_size + 15
-                if carry_bytes < 0:
-                    carry_bytes = 0.0
-
-        ts = timestamp & 0xFFFFFFFF
-        new_header = (
-            bytes([tag_type])
-            + data_size.to_bytes(3, "big")
-            + (ts & 0xFFFFFF).to_bytes(3, "big")
-            + bytes([ts >> 24])
-            + stream_id
-        )
-        output.write(new_header + payload + struct.pack(">I", 11 + data_size))
-        if tag_type == 9:
-            output.flush()
-
-    output.flush()
-
-# ---------------------------------------------------------------------------
-# إدارة البث المتعدد والإشعارات الذكية
-# ---------------------------------------------------------------------------
 
 def notify_telegram(message: str):
     if not BOT_TOKEN or not os.path.exists(CONFIG_PATH):
@@ -176,43 +78,49 @@ def check_is_live(tiktok_url: str) -> bool:
 
 def verify_live_ended(tiktok_url: str, stop_event: threading.Event) -> bool:
     """
-    تحقق صارم متعدد المراحل (45 ثانية) للتأكد من أن البث انتهى فعلياً،
-    وليس مجرد تبديل قست (Co-host switch) أو بطء لحظي في سيرفرات تيك توك.
+    تحقق ذكي متعدد المراحل (45 ثانية) للتأكد من أن البث انتهى فعلياً
+    وليس مجرد تبديل قست أو جولة باتل أو تأخر لحظي في سيرفرات تيك توك.
     """
     for attempt in range(5):
         if stop_event.is_set():
             return True
         stop_event.wait(8)
         if check_is_live(tiktok_url):
-            return False  # البث لا زال حياً!
+            return False
     return True
 
 def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: str) -> str:
-    # جودات H.264 الصريحة فقط (حظر HEVC تماماً)
+    # نقاء H.264 التام بدون HEVC إطلاقاً
     H264_QUALITY = "h264_hd,h264_sd,720p,h264_origin"
 
-    if platform in ["Facebook", "Instagram"]:
-        # منصات Meta (Facebook & Instagram):
-        # بت ريت 2500k ثابت | إطارات 30fps CFR | فاصل Keyframe كل 2 ثانية (GOP=60) | صوت AAC 128k
+    # منصات Meta (Facebook & Instagram) أو خيارات التشفير العالي/الشاشات الثابتة:
+    # تتطلب بث CFR ثابت 30fps وبت ريت 2500k ثابت وصوت 128k لتفادي هبوط الـ 169k أو الـ 508k
+    needs_transcode = (platform in ["Facebook", "Instagram"]) or (layout in ["landscape_to_portrait_pad", "portrait_stable", "landscape_raw"])
+
+    if needs_transcode:
         if layout == "landscape_to_portrait_pad":
             vf_filter = (
+                "fps=30,"
                 "scale=w=720:h=1280:force_original_aspect_ratio=decrease,"
                 "pad=720:1280:(ow-iw)/2:(oh-ih)*0.38:black,"
                 "format=yuv420p"
             )
         elif layout == "landscape_raw" and platform == "Facebook":
             vf_filter = (
+                "fps=30,"
                 "scale=w=1280:h=720:force_original_aspect_ratio=decrease,"
                 "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,"
                 "format=yuv420p"
             )
         else:
             vf_filter = (
+                "fps=30,"
                 "scale=w=720:h=1280:force_original_aspect_ratio=decrease,"
                 "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,"
                 "format=yuv420p"
             )
 
+        # متوافق مع كافة نسخ FFmpeg عبر -vsync 1 و -r 30 (تجنب -fps_mode لعدم دعمه في ffmpeg 4.4)
         return (
             f"set -o pipefail; "
             f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
@@ -222,57 +130,28 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
             f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
             f"-vf '{vf_filter}' "
             f"-c:v libx264 -preset ultrafast -tune zerolatency "
-            f"-b:v 2500k -minrate 1800k -maxrate 3200k -bufsize 5000k "
-            f"-r 30 -fps_mode cfr -g 60 -keyint_min 60 -sc_threshold 0 "
+            f"-b:v 2500k -minrate 2000k -maxrate 3000k -bufsize 5000k "
+            f"-r 30 -vsync 1 -g 60 -keyint_min 60 -sc_threshold 0 "
             f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
             f"-af 'aresample=async=1000:min_hard_comp=0.100000:first_pts=0' "
             f"-max_muxing_queue_size 2048 "
-            f"-rtmp_live live -rtmp_buffer 1000 "
             f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
         )
-
     else:
-        # منصة YouTube والروابط المخصصة:
-        if layout == "landscape_to_portrait_pad":
-            vf_filter = (
-                "scale=w=720:h=1280:force_original_aspect_ratio=decrease,"
-                "pad=720:1280:(ow-iw)/2:(oh-ih)*0.38:black,"
-                "format=yuv420p"
-            )
-            return (
-                f"set -o pipefail; "
-                f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-                f"mbuffer -q -m 32M -P 2 | "
-                f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
-                f"-fflags +genpts+discardcorrupt "
-                f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
-                f"-vf '{vf_filter}' "
-                f"-c:v libx264 -preset ultrafast -tune zerolatency "
-                f"-b:v 2500k -minrate 1800k -maxrate 3500k -bufsize 5000k "
-                f"-r 30 -fps_mode cfr -g 60 -keyint_min 60 -sc_threshold 0 "
-                f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
-                f"-af 'aresample=async=1000:min_hard_comp=0.100000:first_pts=0' "
-                f"-max_muxing_queue_size 2048 "
-                f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
-            )
-        else:
-            # كود دكتور شاكر المعتمد والمثبت 100%:
-            return (
-                f"set -o pipefail; "
-                f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-                f"mbuffer -q -m 48M -P 2 | "
-                f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
-                f"-fflags +genpts+discardcorrupt "
-                f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
-                f"-c:v copy "
-                f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
-                f"-af 'aresample=async=1000:min_hard_comp=0.100000:first_pts=0' "
-                f"-max_muxing_queue_size 2048 "
-                f"-flvflags no_duration_filesize -f flv pipe:1 | "
-                f"python3 restreamer.py --filler {FILLER_KBPS} | "
-                f"ffmpeg -hide_banner -nostdin -loglevel warning "
-                f"-f flv -i pipe:0 -c copy -flvflags no_duration_filesize -f flv {shlex.quote(target)}"
-            )
+        # يوتيوب والروابط المخصصة في النمط الطولي الأصلي (كود دكتور شاكر المباشر 0% معالج):
+        return (
+            f"set -o pipefail; "
+            f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
+            f"mbuffer -q -m 32M -P 2 | "
+            f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
+            f"-fflags +genpts+discardcorrupt "
+            f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
+            f"-c:v copy "
+            f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
+            f"-af 'aresample=async=1000:min_hard_comp=0.100000:first_pts=0' "
+            f"-max_muxing_queue_size 2048 "
+            f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
+        )
 
 def stream_worker(stream_data: dict, stop_event: threading.Event):
     user = stream_data["tiktok_user"]
@@ -282,21 +161,23 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
     tiktok_url = f"https://www.tiktok.com/@{user}/live"
 
     layout_desc = {
-        "portrait_copy": "📱 طولي أصلي (نسخ كودك شاكر)",
+        "portrait_copy": "📱 طولي أصلي (نسخ مباشر)",
+        "portrait_stable": "⚡ طولي فائق الثبات (30fps & 2500k)",
         "landscape_to_portrait_pad": "🎬 طولي بشاشة سوداء وتكبير 80%",
         "landscape_raw": "🖥️ عرضي كامل كما هو"
-    }.get(layout, "📱 طولي أصلي")
+    }.get(layout, "📱 طولي")
 
     log(f"[{user}] بدء مراقبة الحساب للبث إلى {platform} ({tiktok_url}) - النمط: {layout_desc}")
 
     is_currently_live = False
+    consecutive_fast_crashes = 0
 
     while not stop_event.is_set():
         is_live = check_is_live(tiktok_url)
 
         if not is_live:
             if is_currently_live:
-                log(f"[{user}] إشارة أولية لتوقف البث، فحص صارم لـ 45 ثانية لتأكيد انتهاء البث...")
+                log(f"[{user}] فحص ذكي (45 ثانية) للتأكد من انتهاء البث...")
                 really_ended = verify_live_ended(tiktok_url, stop_event)
                 if really_ended:
                     is_currently_live = False
@@ -316,7 +197,7 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
                 f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\n"
                 f"• <b>المنصة:</b> {platform}\n"
                 f"• <b>النمط:</b> {layout_desc}\n"
-                f"🚀 جاري الإرسال المباشر فوراً (معايير دكتور شاكر المعتمدة)!"
+                f"🚀 جاري الإرسال المباشر فوراً بأعلى درجات الاستقرار!"
             )
 
         pipeline_cmd = build_pipeline_command(tiktok_url, target, platform, layout)
@@ -349,37 +230,53 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
             pass
         ACTIVE_PROCESSES.pop(user, None)
 
-        # إعادة تشغيل فورية (1 ثانية فقط) زي كود دكتور شاكر لو البث ما زال حياً:
-        stop_event.wait(1)
+        duration = time.time() - start_time
+        if duration < 25:
+            consecutive_fast_crashes += 1
+            backoff = min(20, 3 * consecutive_fast_crashes)
+            log(f"[{user}] خط الأنابيب توقف سريعاً ({duration:.1f} ث). تهدئة {backoff} ثوانٍ لتفادي خنق باقي البثوث...")
+            stop_event.wait(backoff)
+        else:
+            consecutive_fast_crashes = 0
+            stop_event.wait(1)
 
 def main():
-    if len(sys.argv) >= 3 and sys.argv[1] == "--filler":
-        run_filler(int(sys.argv[2]), MAX_CAP_KBPS)
-        return
-
-    log(f"محرك إدارة البثوث قيد التشغيل (التحديث الصامت الذكي نشط، معايير دكتور شاكر، ثبات Meta)...")
+    log("محرك إدارة البثوث قيد التشغيل (ثبات فائق، دعم Meta 2500k، وتحديث ذكي صامت بدون مقاطعة)...")
     with open("/tmp/daemon_ready", "w") as f:
         f.write("ok")
 
-    workers = {}
+    workers = {}  # user -> {"thread": th, "stop": stop_evt, "data": dict}
 
     while True:
-        # نظام التحديث الصامت الذكي (Graceful Hot-Reload):
-        # يمنع إغلاق أي بث شغال على الإطلاق عند إضافة/تعديل أي بث آخر!
         if os.path.exists("/tmp/reload_restreamer"):
             try:
                 os.remove("/tmp/reload_restreamer")
             except OSError:
                 pass
-            log("🔄 جاري مزامنة البثوث صامتاً بدون مقاطعة أي بث يعمل حالياً...")
 
-            configured = load_streams()
-            active_users = {s["tiktok_user"]: s for s in configured if s.get("enabled", True)}
+        configured = load_streams()
+        active_users = {s["tiktok_user"]: s for s in configured if s.get("enabled", True)}
 
-            # 1. إيقاف البثوث التي تم حذفها أو تعطيلها فقط
-            for u in list(workers.keys()):
-                if u not in active_users:
-                    log(f"🛑 تم إيقاف أو حذف الحساب @{u}، جاري إيقاف مراقبته فقط.")
+        # 1. إيقاف البثوث التي تم حذفها أو تعطيلها فقط
+        for u in list(workers.keys()):
+            if u not in active_users:
+                log(f"إيقاف مراقبة الحساب: @{u}")
+                workers[u]["stop"].set()
+                if u in ACTIVE_PROCESSES:
+                    try:
+                        os.killpg(os.getpgid(ACTIVE_PROCESSES[u].pid), 15)
+                    except Exception:
+                        pass
+                del workers[u]
+
+        # 2. فحص البثوث الحالية: هل تغيرت إعدادات أي بث (مثل المفتاح أو النمط أو المنصة)؟
+        for u, sdata in active_users.items():
+            if u in workers:
+                old_data = workers[u].get("data", {})
+                if (old_data.get("target_url") != sdata.get("target_url") or
+                    old_data.get("layout") != sdata.get("layout") or
+                    old_data.get("platform") != sdata.get("platform")):
+                    log(f"🔄 تم رصد تحديث إعدادات @{u}، جاري إعادة تشغيل هذا البث فقط دون لمس البقية...")
                     workers[u]["stop"].set()
                     if u in ACTIVE_PROCESSES:
                         try:
@@ -388,51 +285,13 @@ def main():
                             pass
                     del workers[u]
 
-            # 2. فحص البثوث التي تم تعديل إعداداتها فقط (مثل تغيير المفتاح أو المقاس)
-            for u, sdata in active_users.items():
-                if u in workers:
-                    old_cfg = workers[u].get("data", {})
-                    if (old_cfg.get("target_url") != sdata.get("target_url") or
-                        old_cfg.get("platform") != sdata.get("platform") or
-                        old_cfg.get("layout") != sdata.get("layout")):
-                        log(f"🔄 تم تحديث إعدادات @{u}، جاري إعادة تشغيل هذا البث فقط...")
-                        workers[u]["stop"].set()
-                        if u in ACTIVE_PROCESSES:
-                            try:
-                                os.killpg(os.getpgid(ACTIVE_PROCESSES[u].pid), 15)
-                            except Exception:
-                                pass
-                        del workers[u]
-
-            # 3. تشغيل البثوث الجديدة أو المحدثة فقط (البثوث الشغالة التانية تفضل مستمرة تماماً)
-            for u, sdata in active_users.items():
-                if u not in workers or not workers[u]["thread"].is_alive():
-                    stop_evt = threading.Event()
-                    th = threading.Thread(target=stream_worker, args=(sdata, stop_evt), daemon=True)
-                    th.start()
-                    workers[u] = {"thread": th, "stop": stop_evt, "data": dict(sdata)}
-
-        else:
-            # الفحص الدوري العادي في الخلفية
-            configured = load_streams()
-            active_users = {s["tiktok_user"]: s for s in configured if s.get("enabled", True)}
-
-            for u in list(workers.keys()):
-                if u not in active_users:
-                    workers[u]["stop"].set()
-                    if u in ACTIVE_PROCESSES:
-                        try:
-                            os.killpg(os.getpgid(ACTIVE_PROCESSES[u].pid), 15)
-                        except Exception:
-                            pass
-                    del workers[u]
-
-            for u, sdata in active_users.items():
-                if u not in workers or not workers[u]["thread"].is_alive():
-                    stop_evt = threading.Event()
-                    th = threading.Thread(target=stream_worker, args=(sdata, stop_evt), daemon=True)
-                    th.start()
-                    workers[u] = {"thread": th, "stop": stop_evt, "data": dict(sdata)}
+        # 3. تشغيل أي بث جديد أو محدّث فقط (البثوث الشغالة بدون تغيير لا يتم لمسها إطلاقاً!)
+        for u, sdata in active_users.items():
+            if u not in workers or not workers[u]["thread"].is_alive():
+                stop_evt = threading.Event()
+                th = threading.Thread(target=stream_worker, args=(sdata, stop_evt), daemon=True)
+                th.start()
+                workers[u] = {"thread": th, "stop": stop_evt, "data": dict(sdata)}
 
         time.sleep(2)
 
