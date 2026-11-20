@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-High-Performance Multi-Channel TikTok Restreamer (Hardened Enterprise Edition).
-Key Architecture & Hardening:
-- Full Stream Isolation: Process Groups (os.setsid), SIGTERM -> SIGKILL escalation with proc.wait().
-- YouTube Live: Exact Dr. Shaker copy pipeline (pure H.264 -c:v copy, 48M buffer, H.264 NAL filler 2000k-3500k).
-- Meta (Facebook & Instagram): Strict 2500k CBR (nal-hrd=cbr), 30fps CFR, 128k AAC audio, 32M buffer with instant startup.
-- Dynamic Live Zoom System: Adjust zoom from 50% up to 200% (in 5% steps) ON THE FLY while stream is live!
-- State Decoupling: is_live status written to status.json atomically to eliminate race conditions with bot.py.
-- Staggered Rate-Limiting: TIKTOK_CHECK_LOCK + 15s offline interval to protect IP from TikTok bans.
-- Zero Cross-Stream Interference: Updating, zooming, or stopping one stream NEVER touches or interrupts others.
+High-Performance Multi-Channel TikTok Restreamer (Hardened Edition).
+- YouTube Live: Dr. Shaker copy pipeline (0% CPU video, 24M buffer, H.264 NAL filler 2000k-3500k, flush_packets).
+- Meta (Facebook & Instagram): Strict 2500k CBR (nal-hrd=cbr, bufsize 5000k), 30fps CFR, 128k AAC, nice -n 10.
+- Dynamic Live Zoom (50% - 200%) with smooth vertical alignment & even dimensions.
+- Full Process Group isolation (os.setsid + SIGTERM/SIGKILL + thread.join) & atomic status.json.
 """
 
 import json
@@ -32,43 +28,24 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 FILLER_KBPS = int(os.environ.get("FILLER_KBPS", 2000))
 MAX_CAP_KBPS = 3500
 
-TIKTOK_CHECK_LOCK = threading.Lock()
-TIKTOK_START_LOCK = threading.Lock()
-LAST_TIKTOK_CHECK_TIME = 0.0
+TIKTOK_API_LOCK = threading.Lock()
+LAST_TIKTOK_REQ = 0.0
+MIN_TIKTOK_GAP = 4.0
 
+STATUS_LOCK = threading.Lock()
 LAST_VALID_STREAMS = []
+ACTIVE_PROCS = {}  # stream_id -> subprocess.Popen
+ACTIVE_PROCS_LOCK = threading.Lock()
+SHUTDOWN_EVENT = threading.Event()
+
 
 def log(msg: str):
-    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
-# ---------------------------------------------------------------------------
-# إدارة العمليات وإغلاقها بأمان تام (منع Zombies والعمليات اليتيمة)
-# ---------------------------------------------------------------------------
-
-def kill_process_group(proc: subprocess.Popen):
-    """
-    إغلاق آمن وحاسم لمجموعة العمليات (streamlink + mbuffer + ffmpeg):
-    إرسال SIGTERM أولاً، انتظار ثانيتين، ثم تصعيد لـ SIGKILL مع proc.wait().
-    """
-    if proc is None:
-        return
-    try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
-        proc.wait(timeout=2.0)
-    except subprocess.TimeoutExpired:
-        try:
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGKILL)
-            proc.wait(timeout=2.0)
-        except Exception:
-            pass
-    except Exception:
-        pass
 
 # ---------------------------------------------------------------------------
-# محرك حشو البت ريت الأصلي الخاص بكود دكتور شاكر (لليوتيوب)
+# محرك حشو البت ريت الأصلي (كود دكتور شاكر لليوتيوب)
 # ---------------------------------------------------------------------------
 
 def run_filler(target_kbps: int, max_cap_kbps: int = 3500) -> None:
@@ -161,8 +138,9 @@ def run_filler(target_kbps: int, max_cap_kbps: int = 3500) -> None:
     except (BrokenPipeError, IOError):
         pass
 
+
 # ---------------------------------------------------------------------------
-# إدارة الحالة والإشعارات (فصل الحالة اللحظية لمنع Race Conditions)
+# إدارة الحالة الذرية، الإشعارات، وحماية اتصالات تيك توك
 # ---------------------------------------------------------------------------
 
 def notify_telegram(message: str):
@@ -178,10 +156,8 @@ def notify_telegram(message: str):
     except Exception as e:
         log(f"[NOTIFY_ERROR] {e}")
 
-def load_streams_safe() -> list:
-    """
-    قراءة آمنة لملف streams.json مع الاحتفاظ بآخر حالة صالحة عند تعذر القراءة.
-    """
+
+def load_streams() -> list:
     global LAST_VALID_STREAMS
     if os.path.exists(STREAMS_PATH):
         try:
@@ -190,82 +166,97 @@ def load_streams_safe() -> list:
                 if isinstance(data, list):
                     for idx, s in enumerate(data):
                         if not s.get("id"):
-                            s["id"] = f"{s.get('tiktok_user')}_{s.get('platform', 'yt')}_{idx}"
+                            s["id"] = f"{s.get('tiktok_user')}_{idx}"
                     LAST_VALID_STREAMS = data
                     return data
         except Exception:
             pass
     return list(LAST_VALID_STREAMS)
 
+
 def update_stream_live_status(stream_id: str, tiktok_user: str, is_live: bool):
-    """
-    كتابة ذرية مستقلة في data/status.json لحماية streams.json من التلف.
-    """
-    try:
-        current = {}
+    """كتابة الحالة اللحظية في status.json فقط دون لمس streams.json أبداً."""
+    with STATUS_LOCK:
+        statuses = {}
         if os.path.exists(STATUS_PATH):
             try:
                 with open(STATUS_PATH, "r", encoding="utf-8") as f:
-                    current = json.load(f)
+                    statuses = json.load(f)
             except Exception:
-                current = {}
+                statuses = {}
 
-        current[stream_id] = {"is_live": is_live, "user": tiktok_user, "ts": time.time()}
-        current[tiktok_user] = {"is_live": is_live, "ts": time.time()}
+        cur = statuses.get(stream_id, {})
+        if cur.get("is_live") == is_live and cur.get("tiktok_user") == tiktok_user:
+            return
 
+        statuses[stream_id] = {"is_live": is_live, "tiktok_user": tiktok_user, "updated_at": time.time()}
         tmp_path = STATUS_PATH + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(current, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, STATUS_PATH)
-    except Exception as e:
-        log(f"[STATUS_ERROR] {e}")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(statuses, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, STATUS_PATH)
+        except Exception as e:
+            log(f"[STATUS_SAVE_ERR] {e}")
 
-# ---------------------------------------------------------------------------
-# فحص حالة تيك توك مع قفل وتوزيع زمني لمنع حظر الـ IP
-# ---------------------------------------------------------------------------
+
+def acquire_tiktok_slot():
+    global LAST_TIKTOK_REQ
+    with TIKTOK_API_LOCK:
+        now = time.monotonic()
+        wait = MIN_TIKTOK_GAP - (now - LAST_TIKTOK_REQ)
+        if wait > 0:
+            time.sleep(wait)
+        LAST_TIKTOK_REQ = time.monotonic()
+
 
 def check_is_live(tiktok_url: str) -> bool:
-    global LAST_TIKTOK_CHECK_TIME
-    with TIKTOK_CHECK_LOCK:
-        now = time.time()
-        elapsed = now - LAST_TIKTOK_CHECK_TIME
-        if elapsed < 2.5:
-            time.sleep(2.5 - elapsed)
-        LAST_TIKTOK_CHECK_TIME = time.time()
+    acquire_tiktok_slot()
+    try:
+        cmd = ["streamlink", "--no-config", "--json", tiktok_url]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0 and res.stdout:
+            data = json.loads(res.stdout)
+            if "streams" in data and data["streams"]:
+                return True
+    except Exception:
+        pass
+    return False
 
-        try:
-            cmd = ["streamlink", "--no-config", "--json", tiktok_url]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            if res.returncode == 0 and res.stdout:
-                data = json.loads(res.stdout)
-                if "streams" in data and data["streams"]:
-                    return True
-        except Exception:
-            pass
-        return False
 
 def verify_live_ended(tiktok_url: str, stop_event: threading.Event) -> bool:
-    for attempt in range(4):
-        if stop_event.is_set():
+    for _ in range(4):
+        if stop_event.is_set() or SHUTDOWN_EVENT.is_set():
             return True
         stop_event.wait(10)
         if check_is_live(tiktok_url):
             return False
     return True
 
+
+def kill_process_group(proc: subprocess.Popen):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
-# فلتر التكبير الديناميكي الهندسي (من 50% حتى 200%)
+# فلتر التكبير الديناميكي (من 50% حتى 200%)
 # ---------------------------------------------------------------------------
 
 def get_zoom_filter(zoom_pct: int = 80, pos_y: float = 0.38) -> str:
-    """
-    توليد فلتر FFmpeg ديناميكي للتكبير والشاشة السوداء متوافق مع FFmpeg 4.4:
-    - أبعاد زوجية مضمونة 100% لمنع كود 255.
-    - ثبات الموضع العمودي pos_y في الحالتين لمنع القفزات المفاجئة للصورة.
-    - إحداثيات قص (crop) غير سالبة دائماً: max(0\,...).
-    """
     scale_w = int(720 * (zoom_pct / 100.0))
     if scale_w % 2 != 0:
         scale_w += 1
@@ -282,22 +273,20 @@ def get_zoom_filter(zoom_pct: int = 80, pos_y: float = 0.38) -> str:
         return (
             f"fps=30,"
             f"scale=w={scale_w}:h=-2:flags=bicubic,"
-            f"crop=w=min(iw\\,720):h=min(ih\\,1280):max(0\\,(iw-720)/2):max(0\\,(ih-1280)*{pos_y}),"
+            f"crop=w=min(iw\\,720):h=min(ih\\,1280):max(0\\,(iw-720)/2):max(0\\,(ih-1280)/2),"
             f"pad=720:1280:(ow-iw)/2:(oh-ih)*{pos_y}:black,"
             f"format=yuv420p"
         )
 
+
 # ---------------------------------------------------------------------------
-# بناء أوامر البث (يوتيوب زي دكتور شاكر | فيسبوك وإنستا 2500k ببافر عريض)
+# بناء أوامر البث (متوافقة 100% مع FFmpeg 4.4)
 # ---------------------------------------------------------------------------
 
 def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: str, zoom_pct: int = 80) -> str:
     H264_QUALITY = "h264_hd,h264_sd,720p,h264_origin"
 
     if platform in ["Facebook", "Instagram"]:
-        # منصات Meta (Facebook & Instagram):
-        # تشفير 2500k CBR صارم مع حشو داخلي nal-hrd=cbr وإطارات 30fps ثابتة
-        # بافر 32M -P 2 مع probesize 10M لسرعة البدء الفوري دون انتظار 85 ثانية
         if layout == "landscape_raw":
             vf_filter = (
                 "fps=30,"
@@ -308,7 +297,6 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
         elif layout == "landscape_to_portrait_pad":
             vf_filter = get_zoom_filter(zoom_pct)
         else:
-            # طولي أصلي
             vf_filter = (
                 "fps=30,"
                 "scale=w=720:h=1280:force_original_aspect_ratio=decrease,"
@@ -319,50 +307,55 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
         return (
             f"set -o pipefail; "
             f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-            f"mbuffer -q -m 32M -P 2 | "
+            f"mbuffer -q -m 24M -P 1 | "
             f"nice -n 10 ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
             f"-analyzeduration 10M -probesize 10M "
             f"-fflags +genpts+discardcorrupt "
             f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
             f"-vf '{vf_filter}' "
             f"-c:v libx264 -preset superfast -threads 2 "
-            f"-b:v 2500k -minrate 2500k -maxrate 2500k -bufsize 8000k "
+            f"-profile:v high -level 4.1 "
+            f"-b:v 2500k -minrate 2500k -maxrate 2500k -bufsize 5000k "
             f"-x264-params 'nal-hrd=cbr:force-cfr=1:scenecut=0' "
             f"-g 60 -keyint_min 60 -sc_threshold 0 "
             f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
             f"-af 'aresample=async=1000:min_hard_comp=0.100000:first_pts=0' "
             f"-max_muxing_queue_size 4096 "
-            f"-rw_timeout 15000000 "
+            f"-flush_packets 1 -rw_timeout 15000000 "
             f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
         )
 
     else:
-        # منصة YouTube والروابط المخصصة:
-        if layout == "landscape_to_portrait_pad":
-            vf_filter = get_zoom_filter(zoom_pct)
+        if layout == "landscape_to_portrait_pad" or layout == "portrait_stable":
+            vf_filter = (
+                get_zoom_filter(zoom_pct)
+                if layout == "landscape_to_portrait_pad"
+                else "fps=30,scale=w=720:h=1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
+            )
             return (
                 f"set -o pipefail; "
                 f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-                f"mbuffer -q -m 48M -P 2 | "
-                f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
+                f"mbuffer -q -m 24M -P 1 | "
+                f"nice -n 10 ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
                 f"-analyzeduration 10M -probesize 10M "
                 f"-fflags +genpts+discardcorrupt "
                 f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
                 f"-vf '{vf_filter}' "
                 f"-c:v libx264 -preset superfast -threads 2 "
-                f"-b:v 2500k -minrate 2000k -maxrate 3500k -bufsize 5000k "
-                f"-r 30 -vsync 1 -g 60 -keyint_min 60 -sc_threshold 0 "
+                f"-b:v 2500k -minrate 2500k -maxrate 2500k -bufsize 5000k "
+                f"-x264-params 'nal-hrd=cbr:force-cfr=1:scenecut=0' "
+                f"-g 60 -keyint_min 60 -sc_threshold 0 "
                 f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
                 f"-af 'aresample=async=1000:min_hard_comp=0.100000:first_pts=0' "
                 f"-max_muxing_queue_size 2048 "
-                f"-rw_timeout 15000000 "
+                f"-flush_packets 1 -rw_timeout 15000000 "
                 f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
             )
         elif layout == "landscape_raw":
             return (
                 f"set -o pipefail; "
                 f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-                f"mbuffer -q -m 48M -P 2 | "
+                f"mbuffer -q -m 24M -P 1 | "
                 f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
                 f"-fflags +genpts+discardcorrupt "
                 f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
@@ -370,15 +363,15 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
                 f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
                 f"-af 'aresample=async=1000:min_hard_comp=0.100000:first_pts=0' "
                 f"-max_muxing_queue_size 2048 "
-                f"-rw_timeout 15000000 "
+                f"-flush_packets 1 -rw_timeout 15000000 "
                 f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
             )
         else:
-            # كود دكتور شاكر المعتمد والمثبت للطولي الأصلي (نسخ مباشر 0% معالج مع فلتر الحشو):
+            # كود دكتور شاكر المعتمد للطولي الأصلي (نسخ مباشر + حشو NAL)
             return (
                 f"set -o pipefail; "
                 f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-                f"mbuffer -q -m 48M -P 2 | "
+                f"mbuffer -q -m 24M -P 1 | "
                 f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
                 f"-fflags +genpts+discardcorrupt "
                 f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
@@ -389,177 +382,186 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
                 f"-flvflags no_duration_filesize -f flv pipe:1 | "
                 f"python3 -u restreamer.py --filler {FILLER_KBPS} | "
                 f"ffmpeg -hide_banner -nostdin -loglevel warning "
-                f"-f flv -i pipe:0 -c copy -rw_timeout 15000000 -flvflags no_duration_filesize -f flv {shlex.quote(target)}"
+                f"-f flv -i pipe:0 -c copy -flush_packets 1 -rw_timeout 15000000 "
+                f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
             )
 
+
 # ---------------------------------------------------------------------------
-# تشغيل كل بث في مسار معزول تماماً
+# مسار العمل المعزول لكل بث
 # ---------------------------------------------------------------------------
 
-def stream_worker(stream_data: dict, stop_event: threading.Event, worker_ref: dict):
+def stream_worker(stream_data: dict, stop_event: threading.Event):
+    sid = stream_data["id"]
     user = stream_data["tiktok_user"]
-    stream_id = stream_data.get("id") or f"{user}_{stream_data.get('platform')}"
     target = stream_data["target_url"]
     platform = stream_data.get("platform", "YouTube")
     layout = stream_data.get("layout", "portrait_copy")
     zoom_pct = int(stream_data.get("zoom_pct", 80))
     tiktok_url = f"https://www.tiktok.com/@{user}/live"
 
-    layout_desc = {
-        "portrait_copy": "📱 طولي أصلي (نسخ مباشر كود شاكر)",
-        "landscape_to_portrait_pad": f"🎬 طولي بشاشة سوداء وتكبير ({zoom_pct}%)",
-        "landscape_raw": "🖥️ عرضي كامل كما هو"
-    }.get(layout, "📱 طولي")
-
-    log(f"[{user}|{stream_id}] بدء مراقبة الحساب للبث إلى {platform} ({tiktok_url}) - النمط: {layout_desc}")
+    log(f"[{user} | {platform}] بدء المراقبة - النمط: {layout} (تكبير: {zoom_pct}%)")
 
     is_currently_live = False
     consecutive_fast_crashes = 0
 
-    while not stop_event.is_set():
+    while not stop_event.is_set() and not SHUTDOWN_EVENT.is_set():
         is_live = check_is_live(tiktok_url)
 
         if not is_live:
             if is_currently_live:
-                log(f"[{user}|{stream_id}] فحص ذكي للتأكد من انتهاء البث...")
+                log(f"[{user}] فحص تأكيدي (40 ثانية) لانتهاء البث...")
                 really_ended = verify_live_ended(tiktok_url, stop_event)
                 if really_ended:
                     is_currently_live = False
-                    update_stream_live_status(stream_id, user, False)
+                    update_stream_live_status(sid, user, False)
                     notify_telegram(f"⏹️ <b>انتهى البث المباشر لحساب @{user}.</b>\nتم إيقاف النقل إلى {platform}.")
                 else:
-                    log(f"[{user}|{stream_id}] البث ما زال حياً، استمرار البث فوراً!")
+                    log(f"[{user}] البث ما زال حياً، استمرار النقل!")
                     continue
-
-            update_stream_live_status(stream_id, user, False)
-            # فاصل زمني 15 ثانية لحماية حسابات الأوفلاين من حظر تيك توك
+            update_stream_live_status(sid, user, False)
             stop_event.wait(15)
             continue
 
         if not is_currently_live:
             is_currently_live = True
-            update_stream_live_status(stream_id, user, True)
+            update_stream_live_status(sid, user, True)
             notify_telegram(
                 f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\n"
                 f"• <b>المنصة:</b> {platform}\n"
-                f"• <b>النمط:</b> {layout_desc}\n"
                 f"🚀 جاري الإرسال المباشر فوراً!"
             )
 
-        with TIKTOK_START_LOCK:
-            time.sleep(3.0)
+        acquire_tiktok_slot()
+        if stop_event.is_set() or SHUTDOWN_EVENT.is_set():
+            break
 
         pipeline_cmd = build_pipeline_command(tiktok_url, target, platform, layout, zoom_pct)
-        log(f"[{user}|{stream_id}] إطلاق خط الأنابيب إلى: {target}")
+        log(f"[{user} | {platform}] إطلاق خط الأنابيب...")
 
-        err_file = f"/tmp/pipeline_err_{stream_id}.log"
-        with open(err_file, "w") as ef:
-            proc = subprocess.Popen(
-                ["/bin/bash", "-o", "pipefail", "-c", pipeline_cmd],
-                stderr=ef,
-                preexec_fn=os.setsid
-            )
-        worker_ref["proc"] = proc
+        err_file = f"/tmp/pipeline_err_{sid}.log"
+        proc = None
         start_time = time.time()
+        try:
+            with open(err_file, "w") as ef:
+                proc = subprocess.Popen(
+                    ["/bin/bash", "-o", "pipefail", "-c", pipeline_cmd],
+                    stderr=ef,
+                    preexec_fn=os.setsid
+                )
+            with ACTIVE_PROCS_LOCK:
+                ACTIVE_PROCS[sid] = proc
 
-        while not stop_event.is_set():
-            ret = proc.poll()
-            if ret is not None:
-                duration = time.time() - start_time
-                log(f"[{user}|{stream_id}] خط الأنابيب توقف بعد {duration:.1f} ثانية كود: {ret}")
-                break
-            time.sleep(2)
+            while not stop_event.is_set() and not SHUTDOWN_EVENT.is_set():
+                ret = proc.poll()
+                if ret is not None:
+                    duration = time.time() - start_time
+                    log(f"[{user} | {platform}] توقف خط الأنابيب بعد {duration:.1f}ث (كود: {ret})")
+                    break
+                stop_event.wait(1.5)
+        finally:
+            if proc is not None:
+                kill_process_group(proc)
+            with ACTIVE_PROCS_LOCK:
+                if ACTIVE_PROCS.get(sid) is proc:
+                    ACTIVE_PROCS.pop(sid, None)
 
-        kill_process_group(proc)
-        worker_ref["proc"] = None
+        if stop_event.is_set() or SHUTDOWN_EVENT.is_set():
+            break
 
         duration = time.time() - start_time
         if duration < 25:
             consecutive_fast_crashes += 1
-            backoff = min(20, 4 * consecutive_fast_crashes)
-            log(f"[{user}|{stream_id}] خط الأنابيب توقف سريعاً ({duration:.1f} ث). تهدئة {backoff} ثوانٍ لعزل القناة وحماية باقي البثوث...")
+            backoff = min(120, 5 * (2 ** min(consecutive_fast_crashes - 1, 4)))
+            log(f"[{user} | {platform}] توقف سريع ({duration:.1f}ث). تهدئة {backoff}ث لحماية باقي البثوث...")
             stop_event.wait(backoff)
         else:
             consecutive_fast_crashes = 0
             stop_event.wait(2)
+
+
+def stop_worker(worker_entry: dict):
+    worker_entry["stop"].set()
+    sid = worker_entry["data"]["id"]
+    with ACTIVE_PROCS_LOCK:
+        proc = ACTIVE_PROCS.get(sid)
+    if proc:
+        kill_process_group(proc)
+    worker_entry["thread"].join(timeout=5)
+
+
+def handle_shutdown(signum, frame):
+    log(f"استلام إشارة إغلاق ({signum})، جاري تنظيف كافة البثوث بأمان...")
+    SHUTDOWN_EVENT.set()
+    with ACTIVE_PROCS_LOCK:
+        procs = list(ACTIVE_PROCS.values())
+    for p in procs:
+        kill_process_group(p)
+    sys.exit(0)
+
 
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--filler":
         run_filler(int(sys.argv[2]), MAX_CAP_KBPS)
         return
 
-    log("محرك إدارة البثوث قيد التشغيل (إصدار الحماية القصوى | يوتيوب شاكر | ميتا 2500k | تحكم ديناميكي بالحجم)...")
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+
+    log("محرك إدارة البثوث قيد التشغيل (يوتيوب كود شاكر | ميتا 2500k CBR | تحكم ديناميكي معزول)...")
     with open("/tmp/daemon_ready", "w") as f:
         f.write("ok")
 
-    workers = {}  # stream_id -> {"thread": th, "stop": stop_evt, "data": dict, "proc": Popen}
+    workers = {}  # stream_id -> {"thread": th, "stop": stop_evt, "data": dict}
 
-    def sig_handler(sig, frame):
-        log("تم استقبال إشارة إيقاف النظام (SIGTERM/SIGINT)، جاري تنظيف وإغلاق كل العمليات...")
-        for sid, w in list(workers.items()):
-            w["stop"].set()
-            if w.get("proc"):
-                kill_process_group(w["proc"])
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, sig_handler)
-    signal.signal(signal.SIGINT, sig_handler)
-
-    while True:
-        restart_all = False
-        if os.path.exists("/tmp/restart_all_streams"):
-            try:
-                os.remove("/tmp/restart_all_streams")
-                restart_all = True
-                log("🔄 تم استقبال أمر إعادة تشغيل آمن لكل البثوث من البوت...")
-            except OSError:
-                pass
-
+    while not SHUTDOWN_EVENT.is_set():
         if os.path.exists("/tmp/reload_restreamer"):
             try:
                 os.remove("/tmp/reload_restreamer")
             except OSError:
                 pass
 
-        configured = load_streams_safe()
-        active_streams = {s["id"]: s for s in configured if s.get("enabled", True)}
+        if os.path.exists("/tmp/restart_all_streams"):
+            try:
+                os.remove("/tmp/restart_all_streams")
+            except OSError:
+                pass
+            log("🔄 تنفيذ إعادة تشغيل آمنة لكافة البثوث...")
+            for sid in list(workers.keys()):
+                stop_worker(workers.pop(sid))
 
-        # 1. إيقاف البثوث المحذوفة أو المعطلة أو في حالة إعادة التشغيل الشامل
+        configured = load_streams()
+        active_map = {s["id"]: s for s in configured if s.get("enabled", True)}
+
+        # 1. إيقاف البثوث المحذوفة أو المعطلة
         for sid in list(workers.keys()):
-            if sid not in active_streams or restart_all:
-                log(f"إيقاف البث: [{sid}]")
-                workers[sid]["stop"].set()
-                if workers[sid].get("proc"):
-                    kill_process_group(workers[sid]["proc"])
-                workers[sid]["thread"].join(timeout=2.0)
-                del workers[sid]
+            if sid not in active_map:
+                log(f"إيقاف البث: {workers[sid]['data'].get('tiktok_user')} ({sid})")
+                stop_worker(workers.pop(sid))
 
-        # 2. فحص البثوث: هل تغير مفتاح أو مقاس أو نسبة التكبير؟ (Granular Hot-Reload)
-        for sid, sdata in active_streams.items():
+        # 2. التحديث الحصري (Granular Hot-Reload) للبث الذي تغيرت إعداداته فقط
+        for sid, sdata in active_map.items():
             if sid in workers:
-                old_data = workers[sid].get("data", {})
-                if (old_data.get("target_url") != sdata.get("target_url") or
-                    old_data.get("layout") != sdata.get("layout") or
-                    old_data.get("platform") != sdata.get("platform") or
-                    old_data.get("zoom_pct", 80) != sdata.get("zoom_pct", 80)):
-                    log(f"🔄 تم رصد تعديل إعدادات/حجم البث [{sdata.get('tiktok_user')}|{sid}] (تكبير: {sdata.get('zoom_pct', 80)}%)، جاري تطبيق التغيير فوراً دون لمس باقي البثوث...")
-                    workers[sid]["stop"].set()
-                    if workers[sid].get("proc"):
-                        kill_process_group(workers[sid]["proc"])
-                    workers[sid]["thread"].join(timeout=2.0)
-                    del workers[sid]
+                old = workers[sid]["data"]
+                if (
+                    old.get("target_url") != sdata.get("target_url")
+                    or old.get("layout") != sdata.get("layout")
+                    or old.get("platform") != sdata.get("platform")
+                    or old.get("zoom_pct", 80) != sdata.get("zoom_pct", 80)
+                ):
+                    log(f"🔄 تحديث فوري لبث @{sdata['tiktok_user']} ({sid}) دون المساس ببقية البثوث...")
+                    stop_worker(workers.pop(sid))
 
-        # 3. تشغيل أي بث جديد (البثوث المستقرة تظل تعمل بلا أي انقطاع)
-        for sid, sdata in active_streams.items():
+        # 3. تشغيل البثوث الجديدة أو المتوقفة
+        for sid, sdata in active_map.items():
             if sid not in workers or not workers[sid]["thread"].is_alive():
                 stop_evt = threading.Event()
-                w_ref = {"thread": None, "stop": stop_evt, "data": dict(sdata), "proc": None}
-                th = threading.Thread(target=stream_worker, args=(sdata, stop_evt, w_ref), daemon=True)
-                w_ref["thread"] = th
+                th = threading.Thread(target=stream_worker, args=(sdata, stop_evt), daemon=True)
                 th.start()
-                workers[sid] = w_ref
+                workers[sid] = {"thread": th, "stop": stop_evt, "data": dict(sdata)}
 
         time.sleep(2)
+
 
 if __name__ == "__main__":
     main()
