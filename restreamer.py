@@ -670,6 +670,12 @@ def build_persistent_pipeline(target: str, platform: str, layout: str) -> str:
             "format=yuv420p"
         )
 
+    audio_options = (
+        ["-c:a", "copy"]
+        if (not is_meta and layout == "landscape_to_portrait_pad")
+        else ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
+    )
+
     ffmpeg_reencode = [
         "nice", "-n", "10",
         "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "warning",
@@ -683,8 +689,7 @@ def build_persistent_pipeline(target: str, platform: str, layout: str) -> str:
         "-b:v", META_BITRATE, "-minrate", META_BITRATE, "-maxrate", META_BITRATE, "-bufsize", "5000k",
         "-x264-params", "nal-hrd=cbr:force-cfr=1:scenecut=0",
         "-g", str(GOP), "-keyint_min", str(GOP), "-sc_threshold", "0",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-        "-af", "aresample=async=1000:min_hard_comp=0.100000:first_pts=0",
+        *audio_options,
         "-max_muxing_queue_size", "4096",
         "-flvflags", "no_duration_filesize",
         "-f", "flv", target,
