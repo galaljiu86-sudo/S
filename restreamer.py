@@ -2,17 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 High-Performance Multi-Channel TikTok Restreamer.
-Platform & Layout Support:
-- YouTube: Exact Dr. Shaker verified pipeline:
-  * Pure H.264 quality selection (h264_hd,h264_sd,720p,h264_origin - NO HEVC/best fallback).
-  * 48MB mbuffer (-m 48M -P 2).
-  * Video COPY + H.264 Filler NAL (2000k target, 3500k ceiling).
-  * Audio AAC 128k with aresample=async=1000:min_hard_comp=0.100000:first_pts=0.
-  * -max_muxing_queue_size 2048 (NO dangerous max_interleave_delta 0).
-  * Instant auto-reconnect on momentary drops (1s restart delay).
-- Facebook & Instagram: Strict Meta Live API Compliance:
-  * libx264 ultrafast 2500k CBR, 30fps CFR, Keyframe GOP=2s (60 frames), AAC 128k, standard resolution.
-- Resilient Auto-Reconnect: Multi-check 45s verification before declaring stream ended.
+Features:
+- YouTube: Pure H.264 (Dr. Shaker standards), 48MB buffer, filler 2000k/3500k, aresample sync.
+- Facebook & Instagram: Strict Meta Live API Compliance (2500k CBR, 30fps CFR, Keyframe GOP=2s, AAC 128k, 720x1280).
+- Graceful Hot-Reload: Modifying/adding/deleting a stream NEVER interrupts running streams on ANY platform!
+- Multi-check 45s verification to eliminate false stream endings during TikTok co-host/battle transitions.
 """
 
 import json
@@ -194,12 +188,11 @@ def verify_live_ended(tiktok_url: str, stop_event: threading.Event) -> bool:
     return True
 
 def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: str) -> str:
-    # سر ثبات كود دكتور شاكر: حظر HEVC واختيار H.264 فقط صراحة (بدون كلمة best أبداً!)
+    # جودات H.264 الصريحة فقط (حظر HEVC تماماً)
     H264_QUALITY = "h264_hd,h264_sd,720p,h264_origin"
 
     if platform in ["Facebook", "Instagram"]:
         # منصات Meta (Facebook & Instagram):
-        # تشترط معايير صارمة لتفادي الـ 169 Kbps والقفل:
         # بت ريت 2500k ثابت | إطارات 30fps CFR | فاصل Keyframe كل 2 ثانية (GOP=60) | صوت AAC 128k
         if layout == "landscape_to_portrait_pad":
             vf_filter = (
@@ -241,7 +234,6 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
     else:
         # منصة YouTube والروابط المخصصة:
         if layout == "landscape_to_portrait_pad":
-            # تحويل العرضي إلى طولي بشاشة سوداء وتكبير 80% في المنتصف أو فوق المنتصف بسنة
             vf_filter = (
                 "scale=w=720:h=1280:force_original_aspect_ratio=decrease,"
                 "pad=720:1280:(ow-iw)/2:(oh-ih)*0.38:black,"
@@ -265,12 +257,6 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
             )
         else:
             # كود دكتور شاكر المعتمد والمثبت 100%:
-            # - جودة H.264 صريحة بدون best.
-            # - بافر mbuffer 48M -P 2.
-            # - نسخ مباشر بدون كودك (-c:v copy).
-            # - صوت AAC 128k مع aresample دكتور شاكر.
-            # - طابور max_muxing_queue_size 2048 وبدون max_interleave_delta 0.
-            # - حشو البت ريت لـ 2000k وسقف 3500k.
             return (
                 f"set -o pipefail; "
                 f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
@@ -371,50 +357,82 @@ def main():
         run_filler(int(sys.argv[2]), MAX_CAP_KBPS)
         return
 
-    log(f"محرك إدارة البثوث قيد التشغيل (معايير دكتور شاكر لليوتيوب، ودعم Meta الصارم)...")
+    log(f"محرك إدارة البثوث قيد التشغيل (التحديث الصامت الذكي نشط، معايير دكتور شاكر، ثبات Meta)...")
     with open("/tmp/daemon_ready", "w") as f:
         f.write("ok")
 
     workers = {}
 
     while True:
+        # نظام التحديث الصامت الذكي (Graceful Hot-Reload):
+        # يمنع إغلاق أي بث شغال على الإطلاق عند إضافة/تعديل أي بث آخر!
         if os.path.exists("/tmp/reload_restreamer"):
             try:
                 os.remove("/tmp/reload_restreamer")
             except OSError:
                 pass
-            log("🔄 وصل أمر تحديث البثوث من البوت، جاري التطبيق فوراً...")
-            for u, w in list(workers.items()):
-                w["stop"].set()
-                if u in ACTIVE_PROCESSES:
-                    try:
-                        os.killpg(os.getpgid(ACTIVE_PROCESSES[u].pid), 15)
-                    except Exception:
-                        pass
-            workers.clear()
-            ACTIVE_PROCESSES.clear()
-            time.sleep(1)
+            log("🔄 جاري مزامنة البثوث صامتاً بدون مقاطعة أي بث يعمل حالياً...")
 
-        configured = load_streams()
-        active_users = {s["tiktok_user"]: s for s in configured if s.get("enabled", True)}
+            configured = load_streams()
+            active_users = {s["tiktok_user"]: s for s in configured if s.get("enabled", True)}
 
-        for u in list(workers.keys()):
-            if u not in active_users:
-                log(f"إيقاف مراقبة الحساب: @{u}")
-                workers[u]["stop"].set()
-                if u in ACTIVE_PROCESSES:
-                    try:
-                        os.killpg(os.getpgid(ACTIVE_PROCESSES[u].pid), 15)
-                    except Exception:
-                        pass
-                del workers[u]
+            # 1. إيقاف البثوث التي تم حذفها أو تعطيلها فقط
+            for u in list(workers.keys()):
+                if u not in active_users:
+                    log(f"🛑 تم إيقاف أو حذف الحساب @{u}، جاري إيقاف مراقبته فقط.")
+                    workers[u]["stop"].set()
+                    if u in ACTIVE_PROCESSES:
+                        try:
+                            os.killpg(os.getpgid(ACTIVE_PROCESSES[u].pid), 15)
+                        except Exception:
+                            pass
+                    del workers[u]
 
-        for u, sdata in active_users.items():
-            if u not in workers or not workers[u]["thread"].is_alive():
-                stop_evt = threading.Event()
-                th = threading.Thread(target=stream_worker, args=(sdata, stop_evt), daemon=True)
-                th.start()
-                workers[u] = {"thread": th, "stop": stop_evt}
+            # 2. فحص البثوث التي تم تعديل إعداداتها فقط (مثل تغيير المفتاح أو المقاس)
+            for u, sdata in active_users.items():
+                if u in workers:
+                    old_cfg = workers[u].get("data", {})
+                    if (old_cfg.get("target_url") != sdata.get("target_url") or
+                        old_cfg.get("platform") != sdata.get("platform") or
+                        old_cfg.get("layout") != sdata.get("layout")):
+                        log(f"🔄 تم تحديث إعدادات @{u}، جاري إعادة تشغيل هذا البث فقط...")
+                        workers[u]["stop"].set()
+                        if u in ACTIVE_PROCESSES:
+                            try:
+                                os.killpg(os.getpgid(ACTIVE_PROCESSES[u].pid), 15)
+                            except Exception:
+                                pass
+                        del workers[u]
+
+            # 3. تشغيل البثوث الجديدة أو المحدثة فقط (البثوث الشغالة التانية تفضل مستمرة تماماً)
+            for u, sdata in active_users.items():
+                if u not in workers or not workers[u]["thread"].is_alive():
+                    stop_evt = threading.Event()
+                    th = threading.Thread(target=stream_worker, args=(sdata, stop_evt), daemon=True)
+                    th.start()
+                    workers[u] = {"thread": th, "stop": stop_evt, "data": dict(sdata)}
+
+        else:
+            # الفحص الدوري العادي في الخلفية
+            configured = load_streams()
+            active_users = {s["tiktok_user"]: s for s in configured if s.get("enabled", True)}
+
+            for u in list(workers.keys()):
+                if u not in active_users:
+                    workers[u]["stop"].set()
+                    if u in ACTIVE_PROCESSES:
+                        try:
+                            os.killpg(os.getpgid(ACTIVE_PROCESSES[u].pid), 15)
+                        except Exception:
+                            pass
+                    del workers[u]
+
+            for u, sdata in active_users.items():
+                if u not in workers or not workers[u]["thread"].is_alive():
+                    stop_evt = threading.Event()
+                    th = threading.Thread(target=stream_worker, args=(sdata, stop_evt), daemon=True)
+                    th.start()
+                    workers[u] = {"thread": th, "stop": stop_evt, "data": dict(sdata)}
 
         time.sleep(2)
 
