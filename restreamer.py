@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 High-Performance Multi-Channel TikTok Restreamer (Hardened Edition).
-- YouTube Live: Dr. Shaker copy pipeline (0% CPU video, 16M buffer, H.264 NAL filler 2000k-3500k, flush_packets).
+- YouTube Live: Exact Dr. Shaker copy pipeline (0% CPU video, 48M buffer, H.264 NAL filler 2000k-3500k).
 - Meta (Facebook & Instagram): Strict 2500k CBR (nal-hrd=cbr, bufsize 5000k), 30fps CFR, 128k AAC, nice -n 10.
 - Dynamic Live Zoom (50% - 200%): Safe crop+pad for all aspect ratios & instant hot-reload.
 - Full Process Group isolation (os.setsid + SIGTERM/SIGKILL + thread.join) & atomic status.json.
@@ -313,7 +313,6 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
             f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
             f"-af 'aresample=async=1000:min_hard_comp=0.100000:first_pts=0' "
             f"-max_muxing_queue_size 4096 "
-            f"-flush_packets 1 -rw_timeout 15000000 "
             f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
         )
 
@@ -340,14 +339,13 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
                 f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
                 f"-af 'aresample=async=1000:min_hard_comp=0.100000:first_pts=0' "
                 f"-max_muxing_queue_size 2048 "
-                f"-flush_packets 1 -rw_timeout 15000000 "
                 f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
             )
         elif layout == "landscape_raw":
             return (
                 f"set -o pipefail; "
                 f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-                f"mbuffer -q -m 16M -P 0 | "
+                f"mbuffer -q -m 48M -P 2 | "
                 f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
                 f"-fflags +genpts+discardcorrupt "
                 f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
@@ -355,7 +353,6 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
                 f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
                 f"-af 'aresample=async=1000:min_hard_comp=0.100000:first_pts=0' "
                 f"-max_muxing_queue_size 2048 "
-                f"-flush_packets 1 -rw_timeout 15000000 "
                 f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
             )
         else:
@@ -363,7 +360,7 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
             return (
                 f"set -o pipefail; "
                 f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-                f"mbuffer -q -m 16M -P 0 | "
+                f"mbuffer -q -m 48M -P 2 | "
                 f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
                 f"-fflags +genpts+discardcorrupt "
                 f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
@@ -374,8 +371,7 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
                 f"-flvflags no_duration_filesize -f flv pipe:1 | "
                 f"python3 -u restreamer.py --filler {FILLER_KBPS} | "
                 f"ffmpeg -hide_banner -nostdin -loglevel warning "
-                f"-f flv -i pipe:0 -c copy -flush_packets 1 -rw_timeout 15000000 "
-                f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
+                f"-f flv -i pipe:0 -c copy -flvflags no_duration_filesize -f flv {shlex.quote(target)}"
             )
 
 
@@ -447,7 +443,15 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
                 ret = proc.poll()
                 if ret is not None:
                     duration = time.time() - start_time
-                    log(f"[{user} | {platform}] توقف خط الأنابيب بعد {duration:.1f}ث (كود: {ret})")
+                    err_hint = ""
+                    try:
+                        with open(err_file, "r", errors="ignore") as f:
+                            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+                            if lines:
+                                err_hint = " | السبب: " + " / ".join(lines[-2:])
+                    except Exception:
+                        pass
+                    log(f"[{user} | {platform}] توقف خط الأنابيب بعد {duration:.1f}ث (كود: {ret}){err_hint}")
                     break
                 stop_event.wait(1.5)
         finally:
