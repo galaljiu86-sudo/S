@@ -4,7 +4,7 @@
 Multi-Stream Management & Monitoring Telegram Bot
 Auth: Via Admin Telegram Username (No password required)
 Features:
-- Granular stream control (Pause/Resume/Delete/Change Layout).
+- Granular stream control (Pause/Resume/Delete/Change Layout/Change Stream Key).
 - Supports Portrait Copy, Landscape to Portrait (80% zoom & black canvas), and Landscape Raw.
 - Real-time live upload & download speed + Total data transfer.
 - Server capacity & stats.
@@ -184,7 +184,7 @@ def handle_text(message):
             f"🧠 <b>الرام المتبقية الحرة:</b> {free_ram_mb} MB\n\n"
             f"🚀 <b>السعة التقديرية:</b>\n"
             f"• البثوث الطولية (Copy): تستهلك ~180MB رام فقط و ~1% معالج.\n"
-            f"• البثوث المحولة (تعديل الأبعاد والتكبير): تستهلك ~12% معالج فقط بفضل تقنية ultrafast.\n\n"
+            f"• البثوث المحولة (تعديل الأبعاد والتكبير): تستهلك ~8% معالج فقط بفضل تقنية ultrafast.\n\n"
             f"✅ <b>يمكنك إضافة حتى {estimated_more} بثوث إضافية</b> بأمان تام!"
         )
         bot.send_message(chat_id, res, reply_markup=main_keyboard())
@@ -208,7 +208,7 @@ def handle_text(message):
             bot.send_message(chat_id, "ℹ️ ملف السجل غير موجود حالياً.", reply_markup=main_keyboard())
         return
 
-    # 5. قائمة وإدارة البثوث (تشغيل / إيقاف / تغيير المقاس / حذف)
+    # 5. قائمة وإدارة البثوث (تشغيل / إيقاف / تغيير المقاس / تغيير المفتاح / حذف)
     elif text == "📋 قائمة وإدارة البثوث":
         streams = load_streams()
         if not streams:
@@ -236,9 +236,10 @@ def handle_text(message):
             markup = types.InlineKeyboardMarkup(row_width=2)
             toggle_btn = types.InlineKeyboardButton("⏸️ إيقاف مؤقت", callback_data=f"pause_{idx}") if is_enabled else types.InlineKeyboardButton("▶️ تشغيل البث", callback_data=f"resume_{idx}")
             layout_btn = types.InlineKeyboardButton("📐 تغيير المقاس", callback_data=f"chlayout_{idx}")
+            key_btn = types.InlineKeyboardButton("🔑 تغيير المفتاح", callback_data=f"chkey_{idx}")
             del_btn = types.InlineKeyboardButton("🗑️ حذف", callback_data=f"del_{idx}")
             markup.add(toggle_btn, layout_btn)
-            markup.add(del_btn)
+            markup.add(key_btn, del_btn)
 
             bot.send_message(chat_id, msg, reply_markup=markup)
         return
@@ -257,6 +258,42 @@ def handle_text(message):
             "📌 <b>أرسل اسم حساب تيك توك:</b>\n(مثال: <code>c.ahmed.h</code> أو رابط الحساب)",
             reply_markup=types.ReplyKeyboardRemove()
         )
+        return
+
+    # تغيير مفتاح البث (Stream Key) لبث موجود
+    if state == "AWAIT_NEW_KEY":
+        new_key = text.strip()
+        idx = USER_STATES[chat_id].get("stream_idx")
+        streams = load_streams()
+        if idx is not None and 0 <= idx < len(streams):
+            s = streams[idx]
+            if s.get("platform") == "Custom RTMP":
+                s["target_url"] = new_key
+                s["server_url"] = new_key
+                s["stream_key"] = ""
+            else:
+                s["stream_key"] = new_key
+                server_url = s.get("server_url", "")
+                if server_url:
+                    s["target_url"] = f"{server_url.rstrip('/')}/{new_key.lstrip('/')}"
+                else:
+                    s["target_url"] = new_key
+            save_streams(streams)
+            USER_STATES.pop(chat_id, None)
+
+            key_preview = s['stream_key'][:6] + "..." if s.get('stream_key') else "مخصص"
+            bot.send_message(
+                chat_id,
+                f"✅ <b>تم تحديث مفتاح البث بنجاح!</b>\n\n"
+                f"• <b>الحساب:</b> @{s['tiktok_user']}\n"
+                f"• <b>المنصة:</b> {s['platform']}\n"
+                f"• <b>المفتاح الجديد:</b> <code>{key_preview}</code>\n\n"
+                f"🔄 تم تطبيق التغيير فوراً على المحرك.",
+                reply_markup=main_keyboard()
+            )
+        else:
+            USER_STATES.pop(chat_id, None)
+            bot.send_message(chat_id, "⚠️ حدث خطأ أو لم يتم العثور على البث.", reply_markup=main_keyboard())
         return
 
     # خطوات الإضافة (Wizard)
@@ -295,7 +332,7 @@ def handle_text(message):
 
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(
-            types.InlineKeyboardButton("📱 بالطول (افتراضي - نسخ مباشر)", callback_data="orient_portrait"),
+            types.InlineKeyboardButton("📱 بالطول (افتراضي)", callback_data="orient_portrait"),
             types.InlineKeyboardButton("🖥️ بالعرض", callback_data="orient_landscape")
         )
         bot.send_message(
@@ -315,7 +352,7 @@ def handle_text(message):
 
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(
-            types.InlineKeyboardButton("📱 بالطول (افتراضي - نسخ مباشر)", callback_data="orient_portrait"),
+            types.InlineKeyboardButton("📱 بالطول (افتراضي)", callback_data="orient_portrait"),
             types.InlineKeyboardButton("🖥️ بالعرض", callback_data="orient_landscape")
         )
         bot.send_message(
@@ -390,11 +427,9 @@ def handle_orientation(call):
     data = USER_STATES[chat_id]
 
     if call.data == "orient_portrait":
-        # البث الأصلي طولي -> نسخ مباشر بدون تعديل
         data["layout"] = "portrait_copy"
         finalize_add_stream(chat_id, call.message.message_id, data)
     else:
-        # البث الأصلي بالعرض -> نسأله هل نحوله لطولي بشاشة سوداء وتكبير 80%؟
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(
             types.InlineKeyboardButton("🎬 نعم، طولي بشاشة سوداء وتكبير 80%", callback_data="zoom_yes"),
@@ -457,7 +492,7 @@ def handle_change_layout(call):
     if 0 <= idx < len(streams):
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(
-            types.InlineKeyboardButton("📱 طولي أصلي (نسخ مباشر)", callback_data=f"setlay_{idx}_portrait_copy"),
+            types.InlineKeyboardButton("📱 طولي أصلي", callback_data=f"setlay_{idx}_portrait_copy"),
             types.InlineKeyboardButton("🎬 طولي بشاشة سوداء وتكبير 80%", callback_data=f"setlay_{idx}_landscape_to_portrait_pad"),
             types.InlineKeyboardButton("🖥️ عرضي كامل كما هو", callback_data=f"setlay_{idx}_landscape_raw")
         )
@@ -481,6 +516,28 @@ def handle_set_layout(call):
             f"✅ تم تحديث نمط العرض لـ @{streams[idx]['tiktok_user']} إلى:\n<b>{get_layout_title(new_layout)}</b>",
             call.message.chat.id, call.message.message_id
         )
+
+# تغيير مفتاح البث (Stream Key)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("chkey_"))
+def handle_change_key(call):
+    chat_id = call.message.chat.id
+    idx = int(call.data.split("_")[1])
+    streams = load_streams()
+    if 0 <= idx < len(streams):
+        s = streams[idx]
+        USER_STATES[chat_id] = {"step": "AWAIT_NEW_KEY", "stream_idx": idx}
+        if s.get("platform") == "Custom RTMP":
+            bot.send_message(
+                chat_id,
+                f"🔑 <b>أرسل الآن الرابط الجديد بالكامل لـ @{s['tiktok_user']}:</b>\n(مثال: <code>rtmp://...</code>)",
+                reply_markup=types.ReplyKeyboardRemove()
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                f"🔑 <b>أرسل الآن مفتاح البث (Stream Key) الجديد لحساب @{s['tiktok_user']} على {s['platform']}:</b>",
+                reply_markup=types.ReplyKeyboardRemove()
+            )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pause_"))
 def handle_pause(call):
