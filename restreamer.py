@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 High-Performance Multi-Channel TikTok Restreamer (Hardened Edition).
-- YouTube Live: Dr. Shaker copy pipeline (0% CPU video, 24M buffer, H.264 NAL filler 2000k-3500k, flush_packets).
+- YouTube Live: Dr. Shaker copy pipeline (0% CPU video, 16M buffer, H.264 NAL filler 2000k-3500k, flush_packets).
 - Meta (Facebook & Instagram): Strict 2500k CBR (nal-hrd=cbr, bufsize 5000k), 30fps CFR, 128k AAC, nice -n 10.
-- Dynamic Live Zoom (50% - 200%) with smooth vertical alignment & even dimensions.
+- Dynamic Live Zoom (50% - 200%): Safe crop+pad for all aspect ratios & instant hot-reload.
 - Full Process Group isolation (os.setsid + SIGTERM/SIGKILL + thread.join) & atomic status.json.
 """
 
@@ -253,7 +253,7 @@ def kill_process_group(proc: subprocess.Popen):
 
 
 # ---------------------------------------------------------------------------
-# فلتر التكبير الديناميكي (من 50% حتى 200%)
+# فلتر التكبير الديناميكي (من 50% حتى 200% لأي أبعاد بدون انهيار)
 # ---------------------------------------------------------------------------
 
 def get_zoom_filter(zoom_pct: int = 80, pos_y: float = 0.38) -> str:
@@ -262,21 +262,13 @@ def get_zoom_filter(zoom_pct: int = 80, pos_y: float = 0.38) -> str:
         scale_w += 1
     scale_w = max(360, min(1440, scale_w))
 
-    if zoom_pct <= 100:
-        return (
-            f"fps=30,"
-            f"scale=w={scale_w}:h=-2:flags=bicubic,"
-            f"pad=720:1280:(ow-iw)/2:(oh-ih)*{pos_y}:black,"
-            f"format=yuv420p"
-        )
-    else:
-        return (
-            f"fps=30,"
-            f"scale=w={scale_w}:h=-2:flags=bicubic,"
-            f"crop=w=min(iw\\,720):h=min(ih\\,1280):max(0\\,(iw-720)/2):max(0\\,(ih-1280)/2),"
-            f"pad=720:1280:(ow-iw)/2:(oh-ih)*{pos_y}:black,"
-            f"format=yuv420p"
-        )
+    return (
+        f"fps=30,"
+        f"scale=w={scale_w}:h=-2:flags=bicubic,"
+        f"crop=w=min(iw\\,720):h=min(ih\\,1280):x=(iw-ow)/2:y=(ih-oh)/2,"
+        f"pad=720:1280:(ow-iw)/2:(oh-ih)*{pos_y}:black,"
+        f"format=yuv420p"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +299,7 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
         return (
             f"set -o pipefail; "
             f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-            f"mbuffer -q -m 24M -P 1 | "
+            f"mbuffer -q -m 16M -P 0 | "
             f"nice -n 10 ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
             f"-analyzeduration 10M -probesize 10M "
             f"-fflags +genpts+discardcorrupt "
@@ -335,7 +327,7 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
             return (
                 f"set -o pipefail; "
                 f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-                f"mbuffer -q -m 24M -P 1 | "
+                f"mbuffer -q -m 16M -P 0 | "
                 f"nice -n 10 ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
                 f"-analyzeduration 10M -probesize 10M "
                 f"-fflags +genpts+discardcorrupt "
@@ -355,7 +347,7 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
             return (
                 f"set -o pipefail; "
                 f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-                f"mbuffer -q -m 24M -P 1 | "
+                f"mbuffer -q -m 16M -P 0 | "
                 f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
                 f"-fflags +genpts+discardcorrupt "
                 f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
@@ -371,7 +363,7 @@ def build_pipeline_command(tiktok_url: str, target: str, platform: str, layout: 
             return (
                 f"set -o pipefail; "
                 f"streamlink --no-config --stdout --stream-timeout 60 --http-timeout 30 --retry-streams 5 {shlex.quote(tiktok_url)} {H264_QUALITY} | "
-                f"mbuffer -q -m 24M -P 1 | "
+                f"mbuffer -q -m 16M -P 0 | "
                 f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
                 f"-fflags +genpts+discardcorrupt "
                 f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
@@ -432,7 +424,6 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
                 f"🚀 جاري الإرسال المباشر فوراً!"
             )
 
-        acquire_tiktok_slot()
         if stop_event.is_set() or SHUTDOWN_EVENT.is_set():
             break
 
