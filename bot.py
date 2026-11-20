@@ -9,7 +9,7 @@ Features:
 - Real-time live upload & download speed + Total data transfer.
 - Server capacity & stats.
 - Live logs viewer.
-- Anti-duplicate messaging.
+- Shortcut '111' for instant reset to main menu.
 """
 
 import json
@@ -96,6 +96,7 @@ def handle_start(message):
         return
 
     save_chat_id(message.chat.id)
+    USER_STATES.pop(message.chat.id, None)
     bot.send_message(
         message.chat.id,
         f"👋 مرحباً بك يا @{message.from_user.username} في لوحة التحكم!\n"
@@ -113,6 +114,17 @@ def handle_text(message):
     chat_id = message.chat.id
     text = message.text.strip()
     save_chat_id(chat_id)
+
+    # اختصار 111 للعودة الفورية للقائمة الرئيسية
+    if text == "111" or text.lower() in ["/cancel", "/home", "رجوع", "إلغاء"]:
+        USER_STATES.pop(chat_id, None)
+        bot.send_message(
+            chat_id,
+            "🏠 <b>تمت العودة للقائمة الرئيسية بنجاح.</b>",
+            reply_markup=main_keyboard()
+        )
+        return
+
     state = USER_STATES.get(chat_id, {}).get("step")
 
     # 1. إحصائيات البثوث
@@ -255,7 +267,7 @@ def handle_text(message):
         USER_STATES[chat_id] = {"step": "AWAIT_TIKTOK_USER"}
         bot.send_message(
             chat_id,
-            "📌 <b>أرسل اسم حساب تيك توك:</b>\n(مثال: <code>c.ahmed.h</code> أو رابط الحساب)",
+            "📌 <b>أرسل اسم حساب تيك توك:</b>\n(مثال: <code>c.ahmed.h</code> أو رابط الحساب)\n\n<i>(أرسل 111 في أي وقت للإلغاء والعودة)</i>",
             reply_markup=types.ReplyKeyboardRemove()
         )
         return
@@ -288,7 +300,7 @@ def handle_text(message):
                 f"• <b>الحساب:</b> @{s['tiktok_user']}\n"
                 f"• <b>المنصة:</b> {s['platform']}\n"
                 f"• <b>المفتاح الجديد:</b> <code>{key_preview}</code>\n\n"
-                f"🔄 تم تطبيق التغيير فوراً على المحرك.",
+                f"🔄 تم تطبيق التغيير فوراً دون مقاطعة البثوث الأخرى.",
                 reply_markup=main_keyboard()
             )
         else:
@@ -370,7 +382,7 @@ def handle_plat(call):
     code = call.data.split("_")[1]
 
     if chat_id not in USER_STATES:
-        bot.send_message(chat_id, "انتهت الجلسة، ابدأ من جديد بالضغط على إضافة بث.")
+        bot.send_message(chat_id, "انتهت الجلسة، ابدأ من جديد بالضغط على إضافة بث أو أرسل 111.")
         return
 
     if code == "fb":
@@ -382,7 +394,7 @@ def handle_plat(call):
         bot.edit_message_text(
             "🔵 <b>تم اختيار Facebook Live</b>\n"
             "الرابط الافتراضي: <code>rtmps://live-api-s.facebook.com:443/rtmp/</code>\n\n"
-            "🔑 أرسل الآن <b>مفتاح البث (Stream Key)</b> الخاص بفيسبوك:",
+            "🔑 أرسل الآن <b>مفتاح البث (Stream Key)</b> الخاص بفيسبوك:\n<i>(أرسل 111 للإلغاء)</i>",
             chat_id, call.message.message_id
         )
     elif code == "ig":
@@ -394,7 +406,7 @@ def handle_plat(call):
         bot.edit_message_text(
             "🟣 <b>تم اختيار Instagram Live</b>\n"
             "الرابط الافتراضي: <code>rtmps://edgetee-upload-hbe1-2.xx.fbcdn.net:443/rtmp/</code>\n\n"
-            "🔑 أرسل الآن <b>مفتاح البث (Stream Key)</b> الخاص بإنستغرام:",
+            "🔑 أرسل الآن <b>مفتاح البث (Stream Key)</b> الخاص بإنستغرام:\n<i>(أرسل 111 للإلغاء)</i>",
             chat_id, call.message.message_id
         )
     elif code == "yt":
@@ -406,13 +418,13 @@ def handle_plat(call):
         bot.edit_message_text(
             "🔴 <b>تم اختيار YouTube Live</b>\n"
             "الرابط الافتراضي: <code>rtmp://a.rtmp.youtube.com/live2/</code>\n\n"
-            "🔑 أرسل الآن <b>مفتاح البث (Stream Key)</b> الخاص بيوتيوب:",
+            "🔑 أرسل الآن <b>مفتاح البث (Stream Key)</b> الخاص بيوتيوب:\n<i>(أرسل 111 للإلغاء)</i>",
             chat_id, call.message.message_id
         )
     elif code == "custom":
         USER_STATES[chat_id].update({"step": "AWAIT_CUSTOM_URL", "platform": "Custom RTMP"})
         bot.edit_message_text(
-            "🌐 أرسل الآن رابط RTMP كاملاً مع المفتاح:",
+            "🌐 أرسل الآن رابط RTMP كاملاً مع المفتاح:\n<i>(أرسل 111 للإلغاء)</i>",
             chat_id, call.message.message_id
         )
 
@@ -529,13 +541,13 @@ def handle_change_key(call):
         if s.get("platform") == "Custom RTMP":
             bot.send_message(
                 chat_id,
-                f"🔑 <b>أرسل الآن الرابط الجديد بالكامل لـ @{s['tiktok_user']}:</b>\n(مثال: <code>rtmp://...</code>)",
+                f"🔑 <b>أرسل الآن الرابط الجديد بالكامل لـ @{s['tiktok_user']}:</b>\n(مثال: <code>rtmp://...</code>)\n\n<i>(أرسل 111 للإلغاء)</i>",
                 reply_markup=types.ReplyKeyboardRemove()
             )
         else:
             bot.send_message(
                 chat_id,
-                f"🔑 <b>أرسل الآن مفتاح البث (Stream Key) الجديد لحساب @{s['tiktok_user']} على {s['platform']}:</b>",
+                f"🔑 <b>أرسل الآن مفتاح البث (Stream Key) الجديد لحساب @{s['tiktok_user']} على {s['platform']}:</b>\n\n<i>(أرسل 111 للإلغاء)</i>",
                 reply_markup=types.ReplyKeyboardRemove()
             )
 
