@@ -4,7 +4,8 @@
 Multi-Stream Management & Monitoring Telegram Bot
 Auth: Via Admin Telegram Username (No password required)
 Features:
-- Granular stream control (Pause/Resume/Delete).
+- Granular stream control (Pause/Resume/Delete/Change Layout).
+- Supports Portrait Copy, Landscape to Portrait (80% zoom & black canvas), and Landscape Raw.
 - Real-time live upload & download speed + Total data transfer.
 - Server capacity & stats.
 - Live logs viewer.
@@ -62,6 +63,14 @@ def save_streams(streams: list):
 def save_chat_id(chat_id: int):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump({"chat_id": chat_id}, f)
+
+def get_layout_title(layout_code: str) -> str:
+    if layout_code == "landscape_to_portrait_pad":
+        return "🎬 طولي بشاشة سوداء وتكبير 80%"
+    elif layout_code == "landscape_raw":
+        return "🖥️ عرضي كامل كما هو"
+    else:
+        return "📱 طولي أصلي (نسخ مباشر)"
 
 USER_STATES = {}
 
@@ -128,19 +137,16 @@ def handle_text(message):
 
     # 2. استهلاك وسرعة السيرفر الفعلية اللحظية + الإجمالي
     elif text == "📈 استهلاك وسرعة السيرفر":
-        # أخذ عينة لمدة ثانية واحدة لحساب السرعة اللحظية الفعلية بدقة
         net_start = psutil.net_io_counters()
         cpu = psutil.cpu_percent(interval=1.0)
         net_end = psutil.net_io_counters()
         ram = psutil.virtual_memory()
 
-        # حساب السرعة اللحظية الحالية (كيلوبايت/ثانية و ميجابت/ثانية)
         up_speed_kb = (net_end.bytes_sent - net_start.bytes_sent) / 1024.0
         down_speed_kb = (net_end.bytes_recv - net_start.bytes_recv) / 1024.0
         up_speed_mbps = (up_speed_kb * 8.0) / 1000.0
         down_speed_mbps = (down_speed_kb * 8.0) / 1000.0
 
-        # إجمالي حركة البيانات منذ بداية تشغيل السيرفر
         total_sent_mb = net_end.bytes_sent / (1024 * 1024)
         total_recv_mb = net_end.bytes_recv / (1024 * 1024)
 
@@ -149,7 +155,7 @@ def handle_text(message):
         minutes = (uptime_sec % 3600) // 60
 
         res = (
-            f"<b>📈 استهلاك وسرعة السيرفر (<code>{MY_NAME}</code>):</b>\n\n"
+            f"<b>📈 استهلاك وموارد السيرفر (<code>{MY_NAME}</code>):</b>\n\n"
             f"⚙️ <b>المعالج (CPU):</b> {cpu}%\n"
             f"🧠 <b>الرام (RAM):</b> {ram.percent}% (مستخدم {ram.used // (1024*1024)}MB من أصل {ram.total // (1024*1024)}MB)\n\n"
             f"🚀 <b>السرعة اللحظية الفعلية (Live Speed):</b>\n"
@@ -177,8 +183,9 @@ def handle_text(message):
             f"📊 <b>البثوث الحالية:</b> {current_streams} بثوث\n"
             f"🧠 <b>الرام المتبقية الحرة:</b> {free_ram_mb} MB\n\n"
             f"🚀 <b>السعة التقديرية:</b>\n"
-            f"بما أن الفيديو يتم نسخه مباشرة بدون إعادة ترميز (Copy Codec)، يستهلك كل بث 180MB رام فقط و ~1% معالج.\n\n"
-            f"✅ <b>يمكنك إضافة حتى {estimated_more} بثوث إضافية</b> بأمان تام (السيرفر يتحمل إجمالاً من 15 إلى 25 بث متزامن)!"
+            f"• البثوث الطولية (Copy): تستهلك ~180MB رام فقط و ~1% معالج.\n"
+            f"• البثوث المحولة (تعديل الأبعاد والتكبير): تستهلك ~12% معالج فقط بفضل تقنية ultrafast.\n\n"
+            f"✅ <b>يمكنك إضافة حتى {estimated_more} بثوث إضافية</b> بأمان تام!"
         )
         bot.send_message(chat_id, res, reply_markup=main_keyboard())
         return
@@ -201,7 +208,7 @@ def handle_text(message):
             bot.send_message(chat_id, "ℹ️ ملف السجل غير موجود حالياً.", reply_markup=main_keyboard())
         return
 
-    # 5. قائمة وإدارة البثوث (تشغيل / إيقاف / حذف)
+    # 5. قائمة وإدارة البثوث (تشغيل / إيقاف / تغيير المقاس / حذف)
     elif text == "📋 قائمة وإدارة البثوث":
         streams = load_streams()
         if not streams:
@@ -217,17 +224,21 @@ def handle_text(message):
             else:
                 status_txt = "⚪ في الانتظار (أوفلاين)"
 
+            layout_str = get_layout_title(s.get("layout", "portrait_copy"))
             key_preview = s['stream_key'][:6] + "..." if s.get('stream_key') else "مخصص"
             msg = (
                 f"<b>#{idx+1} - @{s['tiktok_user']}</b>\n"
                 f"• <b>المنصة:</b> {s['platform']}\n"
+                f"• <b>نمط العرض:</b> {layout_str}\n"
                 f"• <b>المفتاح:</b> <code>{key_preview}</code>\n"
                 f"• <b>الحالة:</b> {status_txt}\n"
             )
             markup = types.InlineKeyboardMarkup(row_width=2)
             toggle_btn = types.InlineKeyboardButton("⏸️ إيقاف مؤقت", callback_data=f"pause_{idx}") if is_enabled else types.InlineKeyboardButton("▶️ تشغيل البث", callback_data=f"resume_{idx}")
+            layout_btn = types.InlineKeyboardButton("📐 تغيير المقاس", callback_data=f"chlayout_{idx}")
             del_btn = types.InlineKeyboardButton("🗑️ حذف", callback_data=f"del_{idx}")
-            markup.add(toggle_btn, del_btn)
+            markup.add(toggle_btn, layout_btn)
+            markup.add(del_btn)
 
             bot.send_message(chat_id, msg, reply_markup=markup)
         return
@@ -248,124 +259,263 @@ def handle_text(message):
         )
         return
 
-    # معالجة خطوات الإضافة (Wizard)
+    # خطوات الإضافة (Wizard)
     if state == "AWAIT_TIKTOK_USER":
-        user_val = text.replace("https://www.tiktok.com/@", "").replace("https://tiktok.com/@", "").lstrip("@").split("/")[0].strip()
-        USER_STATES[chat_id] = {"step": "AWAIT_PLATFORM", "tiktok_user": user_val}
-        
-        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-        markup.add(
-            types.KeyboardButton("YouTube"),
-            types.KeyboardButton("Facebook"),
-            types.KeyboardButton("Instagram"),
-            types.KeyboardButton("Custom RTMP")
-        )
-        bot.send_message(chat_id, f"✅ تم حفظ الحساب: <b>@{user_val}</b>\nاختر المنصة المراد الإرسال إليها:", reply_markup=markup)
-        return
+        match = re.search(r"tiktok\.com/@([^/?#]+)", text)
+        username = match.group(1) if match else text.lstrip("@").strip()
 
-    elif state == "AWAIT_PLATFORM":
-        platform = text
-        USER_STATES[chat_id]["platform"] = platform
-        USER_STATES[chat_id]["step"] = "AWAIT_STREAM_KEY"
-        
-        if platform == "Custom RTMP":
-            bot.send_message(
-                chat_id,
-                "🔗 أرسل رابط الـ RTMP الكامل مع المفتاح:\n(مثال: <code>rtmp://live.twitch.tv/app/live_xyz</code>)",
-                reply_markup=types.ReplyKeyboardRemove()
-            )
-        else:
-            bot.send_message(
-                chat_id,
-                f"🔑 أرسل <b>مفتاح البث (Stream Key)</b> الخاص بـ {platform}:",
-                reply_markup=types.ReplyKeyboardRemove()
-            )
+        USER_STATES[chat_id] = {
+            "step": "CHOOSE_PLATFORM",
+            "tiktok_user": username
+        }
+
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("🔵 Facebook Live", callback_data="plat_fb"),
+            types.InlineKeyboardButton("🟣 Instagram Live", callback_data="plat_ig"),
+            types.InlineKeyboardButton("🔴 YouTube Live", callback_data="plat_yt"),
+            types.InlineKeyboardButton("🌐 Custom RTMP", callback_data="plat_custom")
+        )
+        bot.send_message(
+            chat_id,
+            f"تم تحديد الحساب: <b>@{username}</b>\n\nاختر المنصة المستهدفة للبث:",
+            reply_markup=markup
+        )
         return
 
     elif state == "AWAIT_STREAM_KEY":
-        data = USER_STATES.pop(chat_id, {})
-        platform = data.get("platform", "YouTube")
-        key = text
+        data = USER_STATES[chat_id]
+        stream_key = text.strip()
+        server_url = data["server_url"]
+        target_url = f"{server_url.rstrip('/')}/{stream_key.lstrip('/')}"
 
-        if platform == "YouTube":
-            target = f"rtmp://a.rtmp.youtube.com/live2/{key}"
-        elif platform == "Facebook":
-            target = f"rtmps://live-api-s.facebook.com:443/rtmp/{key}"
-        elif platform == "Instagram":
-            target = f"rtmps://live-upload.instagram.com:443/rtmp/{key}"
-        else:
-            target = key
+        data["stream_key"] = stream_key
+        data["target_url"] = target_url
+        data["step"] = "CHOOSE_ORIENTATION"
 
-        streams = load_streams()
-        streams.append({
-            "tiktok_user": data["tiktok_user"],
-            "platform": platform,
-            "stream_key": key if platform != "Custom RTMP" else "",
-            "target_url": target,
-            "enabled": True,
-            "is_live": False
-        })
-        save_streams(streams)
-
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton("📱 بالطول (افتراضي - نسخ مباشر)", callback_data="orient_portrait"),
+            types.InlineKeyboardButton("🖥️ بالعرض", callback_data="orient_landscape")
+        )
         bot.send_message(
             chat_id,
-            f"🎉 <b>تمت إضافة البث وتفعيله بنجاح!</b>\n\n"
-            f"• <b>حساب تيك توك:</b> @{data['tiktok_user']}\n"
-            f"• <b>المنصة:</b> {data['platform']}\n"
-            f"• سيصلك إشعار فوري لحظة فتح البث.",
-            reply_markup=main_keyboard()
+            "📐 <b>هل البث الأساسي على تيك توك بالطول ولا بالعرض؟</b>",
+            reply_markup=markup
         )
         return
 
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callbacks(call):
-    if not is_admin(call.from_user):
-        bot.answer_callback_query(call.id, "⛔ ليس لديك صلاحية.")
+    elif state == "AWAIT_CUSTOM_URL":
+        target_url = text.strip()
+        data = USER_STATES[chat_id]
+        data["server_url"] = target_url
+        data["stream_key"] = ""
+        data["target_url"] = target_url
+        data["step"] = "CHOOSE_ORIENTATION"
+
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton("📱 بالطول (افتراضي - نسخ مباشر)", callback_data="orient_portrait"),
+            types.InlineKeyboardButton("🖥️ بالعرض", callback_data="orient_landscape")
+        )
+        bot.send_message(
+            chat_id,
+            "📐 <b>هل البث الأساسي على تيك توك بالطول ولا بالعرض؟</b>",
+            reply_markup=markup
+        )
         return
 
-    data = call.data
+# --- Callbacks ---
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("plat_"))
+def handle_plat(call):
+    chat_id = call.message.chat.id
+    code = call.data.split("_")[1]
+
+    if chat_id not in USER_STATES:
+        bot.send_message(chat_id, "انتهت الجلسة، ابدأ من جديد بالضغط على إضافة بث.")
+        return
+
+    if code == "fb":
+        USER_STATES[chat_id].update({
+            "step": "AWAIT_STREAM_KEY",
+            "platform": "Facebook",
+            "server_url": "rtmps://live-api-s.facebook.com:443/rtmp/"
+        })
+        bot.edit_message_text(
+            "🔵 <b>تم اختيار Facebook Live</b>\n"
+            "الرابط الافتراضي: <code>rtmps://live-api-s.facebook.com:443/rtmp/</code>\n\n"
+            "🔑 أرسل الآن <b>مفتاح البث (Stream Key)</b> الخاص بفيسبوك:",
+            chat_id, call.message.message_id
+        )
+    elif code == "ig":
+        USER_STATES[chat_id].update({
+            "step": "AWAIT_STREAM_KEY",
+            "platform": "Instagram",
+            "server_url": "rtmps://edgetee-upload-hbe1-2.xx.fbcdn.net:443/rtmp/"
+        })
+        bot.edit_message_text(
+            "🟣 <b>تم اختيار Instagram Live</b>\n"
+            "الرابط الافتراضي: <code>rtmps://edgetee-upload-hbe1-2.xx.fbcdn.net:443/rtmp/</code>\n\n"
+            "🔑 أرسل الآن <b>مفتاح البث (Stream Key)</b> الخاص بإنستغرام:",
+            chat_id, call.message.message_id
+        )
+    elif code == "yt":
+        USER_STATES[chat_id].update({
+            "step": "AWAIT_STREAM_KEY",
+            "platform": "YouTube",
+            "server_url": "rtmp://a.rtmp.youtube.com/live2/"
+        })
+        bot.edit_message_text(
+            "🔴 <b>تم اختيار YouTube Live</b>\n"
+            "الرابط الافتراضي: <code>rtmp://a.rtmp.youtube.com/live2/</code>\n\n"
+            "🔑 أرسل الآن <b>مفتاح البث (Stream Key)</b> الخاص بيوتيوب:",
+            chat_id, call.message.message_id
+        )
+    elif code == "custom":
+        USER_STATES[chat_id].update({"step": "AWAIT_CUSTOM_URL", "platform": "Custom RTMP"})
+        bot.edit_message_text(
+            "🌐 أرسل الآن رابط RTMP كاملاً مع المفتاح:",
+            chat_id, call.message.message_id
+        )
+
+# معالجة اختيار اتجاه البث (طول / عرض)
+@bot.callback_query_handler(func=lambda call: call.data in ["orient_portrait", "orient_landscape"])
+def handle_orientation(call):
+    chat_id = call.message.chat.id
+    if chat_id not in USER_STATES:
+        bot.send_message(chat_id, "انتهت الجلسة، ابدأ من جديد بالضغط على إضافة بث.")
+        return
+
+    data = USER_STATES[chat_id]
+
+    if call.data == "orient_portrait":
+        # البث الأصلي طولي -> نسخ مباشر بدون تعديل
+        data["layout"] = "portrait_copy"
+        finalize_add_stream(chat_id, call.message.message_id, data)
+    else:
+        # البث الأصلي بالعرض -> نسأله هل نحوله لطولي بشاشة سوداء وتكبير 80%؟
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton("🎬 نعم، طولي بشاشة سوداء وتكبير 80%", callback_data="zoom_yes"),
+            types.InlineKeyboardButton("🖥️ لا، انقله بالعرض كامل كما هو", callback_data="zoom_no")
+        )
+        bot.edit_message_text(
+            "🎬 <b>تحب نخليه بالطول على شاشة سوداء ونكبّره بنسبة 80% (زي التيك توك)؟</b>\n\n"
+            "<i>(الفيديو هيكون في المنتصف أو فوق النص بسنة بسيطة وتحته وفوقه مساحة سوداء مريحة للعين)</i>",
+            chat_id, call.message.message_id,
+            reply_markup=markup
+        )
+
+# معالجة قرار التكبير والشاشة السوداء
+@bot.callback_query_handler(func=lambda call: call.data in ["zoom_yes", "zoom_no"])
+def handle_zoom_decision(call):
+    chat_id = call.message.chat.id
+    if chat_id not in USER_STATES:
+        bot.send_message(chat_id, "انتهت الجلسة، ابدأ من جديد بالضغط على إضافة بث.")
+        return
+
+    data = USER_STATES[chat_id]
+    if call.data == "zoom_yes":
+        data["layout"] = "landscape_to_portrait_pad"
+    else:
+        data["layout"] = "landscape_raw"
+
+    finalize_add_stream(chat_id, call.message.message_id, data)
+
+def finalize_add_stream(chat_id: int, message_id: int, data: dict):
     streams = load_streams()
+    streams.append({
+        "tiktok_user": data["tiktok_user"],
+        "platform": data["platform"],
+        "server_url": data.get("server_url", ""),
+        "stream_key": data.get("stream_key", ""),
+        "target_url": data["target_url"],
+        "layout": data.get("layout", "portrait_copy"),
+        "enabled": True,
+        "is_live": False
+    })
+    save_streams(streams)
+    USER_STATES.pop(chat_id, None)
 
-    if data.startswith("pause_"):
-        idx = int(data.split("_")[1])
-        if idx < len(streams):
-            streams[idx]["enabled"] = False
-            save_streams(streams)
-            bot.answer_callback_query(call.id, f"تم إيقاف @{streams[idx]['tiktok_user']} مؤقتاً")
-            bot.edit_message_text(
-                f"⏸️ <b>تم إيقاف البث لحساب @{streams[idx]['tiktok_user']} مؤقتاً.</b>",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
+    layout_str = get_layout_title(data.get("layout", "portrait_copy"))
+    bot.edit_message_text(
+        f"🎉 <b>تم حفظ البث وبدء مراقبته بنجاح!</b>\n\n"
+        f"• <b>تيك توك:</b> <code>@{data['tiktok_user']}</code>\n"
+        f"• <b>المنصة:</b> {data['platform']}\n"
+        f"• <b>نمط العرض:</b> {layout_str}\n\n"
+        f"🚀 سيصلك إشعار فوري لحظة فتح البث.",
+        chat_id, message_id
+    )
+    bot.send_message(chat_id, "جاهز ومستعد للمراقبة! يمكنك إدارة البثوث عبر الأزرار:", reply_markup=main_keyboard())
 
-    elif data.startswith("resume_"):
-        idx = int(data.split("_")[1])
-        if idx < len(streams):
-            streams[idx]["enabled"] = True
-            save_streams(streams)
-            bot.answer_callback_query(call.id, f"تم استئناف @{streams[idx]['tiktok_user']}")
-            bot.edit_message_text(
-                f"▶️ <b>تم استئناف وتشغيل البث لحساب @{streams[idx]['tiktok_user']}.</b>",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
+# تغيير المقاس للبثوث الموجودة مسبقاً
+@bot.callback_query_handler(func=lambda call: call.data.startswith("chlayout_"))
+def handle_change_layout(call):
+    idx = int(call.data.split("_")[1])
+    streams = load_streams()
+    if 0 <= idx < len(streams):
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton("📱 طولي أصلي (نسخ مباشر)", callback_data=f"setlay_{idx}_portrait_copy"),
+            types.InlineKeyboardButton("🎬 طولي بشاشة سوداء وتكبير 80%", callback_data=f"setlay_{idx}_landscape_to_portrait_pad"),
+            types.InlineKeyboardButton("🖥️ عرضي كامل كما هو", callback_data=f"setlay_{idx}_landscape_raw")
+        )
+        bot.edit_message_text(
+            f"📐 <b>اختر نمط العرض لحساب @{streams[idx]['tiktok_user']}:</b>",
+            call.message.chat.id, call.message.message_id,
+            reply_markup=markup
+        )
 
-    elif data.startswith("del_"):
-        idx = int(data.split("_")[1])
-        if idx < len(streams):
-            removed = streams.pop(idx)
-            save_streams(streams)
-            bot.answer_callback_query(call.id, "تم الحذف")
-            bot.edit_message_text(
-                f"🗑️ <b>تم حذف البث الخاص بـ @{removed['tiktok_user']} نهائياً.</b>",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
+@bot.callback_query_handler(func=lambda call: call.data.startswith("setlay_"))
+def handle_set_layout(call):
+    parts = call.data.split("_")
+    idx = int(parts[1])
+    new_layout = "_".join(parts[2:])
+    streams = load_streams()
+    if 0 <= idx < len(streams):
+        streams[idx]["layout"] = new_layout
+        save_streams(streams)
+        bot.answer_callback_query(call.id, "✅ تم تغيير المقاس بنجاح!")
+        bot.edit_message_text(
+            f"✅ تم تحديث نمط العرض لـ @{streams[idx]['tiktok_user']} إلى:\n<b>{get_layout_title(new_layout)}</b>",
+            call.message.chat.id, call.message.message_id
+        )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pause_"))
+def handle_pause(call):
+    idx = int(call.data.split("_")[1])
+    streams = load_streams()
+    if 0 <= idx < len(streams):
+        streams[idx]["enabled"] = False
+        save_streams(streams)
+        bot.answer_callback_query(call.id, "⏸️ تم إيقاف البث مؤقتاً")
+        bot.edit_message_text(f"⏸️ تم إيقاف بث @{streams[idx]['tiktok_user']} مؤقتاً.", call.message.chat.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("resume_"))
+def handle_resume(call):
+    idx = int(call.data.split("_")[1])
+    streams = load_streams()
+    if 0 <= idx < len(streams):
+        streams[idx]["enabled"] = True
+        save_streams(streams)
+        bot.answer_callback_query(call.id, "▶️ تم استئناف تشغيل البث")
+        bot.edit_message_text(f"▶️ تم تفعيل وتشغيل بث @{streams[idx]['tiktok_user']}.", call.message.chat.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("del_"))
+def handle_delete(call):
+    idx = int(call.data.split("_")[1])
+    streams = load_streams()
+    if 0 <= idx < len(streams):
+        deleted = streams.pop(idx)
+        save_streams(streams)
+        bot.answer_callback_query(call.id, "🗑️ تم الحذف بنجاح!")
+        bot.edit_message_text(f"🗑️ تم حذف بث حساب: @{deleted['tiktok_user']}", call.message.chat.id, call.message.message_id)
 
 if __name__ == "__main__":
-    print(f"[{MY_NAME}] Bot daemon starting...", flush=True)
+    print(f"[BOT] Starting Telegram Bot on {MY_NAME}...", flush=True)
     while True:
         try:
-            bot.polling(none_stop=True, timeout=20, long_polling_timeout=20)
-        except Exception as e:
+            bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        except Exception:
             time.sleep(3)
