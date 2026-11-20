@@ -612,7 +612,7 @@ def build_persistent_pipeline(target: str, platform: str, layout: str) -> str:
     needs_reencode = is_meta or (layout in ("landscape_to_portrait_pad", "portrait_stable"))
 
     if not needs_reencode:
-        # كود يوتيوب الطولي الأصلي بالضبط بدون أي تغيير
+        # كود يوتيوب الطولي (نسخ فيديو 0% CPU + ترميز صوت ناعم لمنع الطقطقة + حشو 3850k)
         buffer_cmd = ["mbuffer", "-q", "-m", f"{YT_BUF_MB}M", "-P", str(YT_PREFILL_PCT)]
         ffmpeg_1 = [
             "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "warning",
@@ -620,7 +620,8 @@ def build_persistent_pipeline(target: str, platform: str, layout: str) -> str:
             "-i", "pipe:0",
             "-map", "0:v:0", "-map", "0:a:0?",
             "-c:v", "copy",
-            "-c:a", "copy",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-af", "aresample=async=1",
             "-max_muxing_queue_size", "2048",
             "-flvflags", "no_duration_filesize",
             "-f", "flv", "pipe:1",
@@ -647,7 +648,7 @@ def build_persistent_pipeline(target: str, platform: str, layout: str) -> str:
 
     if layout == "landscape_to_portrait_pad":
         # تكبير ثابت 180% (100% + 80%) مع قص آمن وتوسيط على خلفية سوداء 720x1280
-        scale_w = 1296  # int(720 * 1.8)
+        scale_w = 1296
         vf_filter = (
             f"fps={FPS},"
             f"scale=w={scale_w}:h=-2:flags=bicubic,"
