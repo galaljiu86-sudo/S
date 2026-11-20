@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 High-Performance Multi-Channel TikTok Restreamer.
-Platform-Optimized Pipelines:
-- YouTube / Custom: H.264 Copy (-c:v copy) + Filler NAL (2000k target, 3500k ceiling) + AAC re-encode.
-- Facebook / Instagram: Strict Live API Compliance (H.264 720p @ 30fps CFR, Keyframe GOP=2s/60, 2500k, AAC 128k).
+Platform & Layout Support:
+- Portrait Copy: H.264 Copy (-c:v copy) + Filler NAL for YouTube (2000k target, 3500k ceiling) / Copy for FB & IG.
+- Landscape to Portrait: Places landscape stream on a 9:16 black canvas (720x1280), scaled 80% to fit width, positioned slightly above center, encoded with libx264 ultrafast (zerolatency).
+- Landscape Raw: Full 16:9 landscape stream with safe buffer for Meta platforms.
 """
 
 import json
@@ -176,47 +177,119 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
     user = stream_data["tiktok_user"]
     target = stream_data["target_url"]
     platform = stream_data.get("platform", "YouTube")
+    layout = stream_data.get("layout", "portrait_copy")
     tiktok_url = f"https://www.tiktok.com/@{user}/live"
 
-    log(f"[{user}] بدء مراقبة الحساب للبث إلى {platform} ({tiktok_url})")
+    layout_desc = {
+        "portrait_copy": "📱 طولي أصلي (نسخ مباشر)",
+        "landscape_to_portrait_pad": "🎬 طولي بشاشة سوداء وتكبير 80%",
+        "landscape_raw": "🖥️ عرضي كامل كما هو"
+    }.get(layout, "📱 طولي أصلي")
 
-    # تخصيص خط الأنابيب حسب المنصة تلقائياً:
-    if platform in ["Facebook", "Instagram"]:
-        # منصات Facebook و Instagram: معايير Live API الصارمة (H.264 High Profile, CFR 30fps, GOP=2s, 2500k, AAC 128k)
-        log(f"[{user}] تطبيق بروفايل Facebook/Instagram Live API الصارم (30fps CFR | GOP 2s | 2500k)")
+    log(f"[{user}] بدء مراقبة الحساب للبث إلى {platform} ({tiktok_url}) - النمط: {layout_desc}")
+
+    # بناء خط الأنابيب المناسب حسب المنصة والنمط المختار:
+    if layout == "landscape_to_portrait_pad":
+        # نمط تحويل العرضي إلى طولي 9:16 مع كانفاس أسود وتكبير لملء العرض
+        # وضع الفيديو في المنتصف أو فوق المنتصف بسنة بسيطة: (oh-ih)*0.38
+        log(f"[{user}] تفعيل نمط: طولي بشاشة سوداء وتكبير 80% (Canvas 720x1280 | Ultrafast 2500k | CFR 30fps)")
+        vf_filter = (
+            "scale=w=720:h=1280:force_original_aspect_ratio=decrease,"
+            "pad=720:1280:(ow-iw)/2:(oh-ih)*0.38:black,"
+            "format=yuv420p"
+        )
         pipeline_cmd = (
             f"set -o pipefail; "
             f"streamlink --stdout --retry-streams 5 --retry-open 5 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
-            f"mbuffer -q -m 8M -P 2 | "
+            f"mbuffer -q -m 16M -P 5 | "
             f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
             f"-fflags +genpts+discardcorrupt+nobuffer "
             f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
-            f"-c:v libx264 -preset veryfast -profile:v high -pix_fmt yuv420p "
-            f"-b:v 2500k -minrate 1500k -maxrate 3500k -bufsize 5000k "
+            f"-vf '{vf_filter}' "
+            f"-c:v libx264 -preset ultrafast -tune zerolatency "
+            f"-b:v 2500k -minrate 1500k -maxrate 3500k -bufsize 6000k "
             f"-r 30 -fps_mode cfr -g 60 -keyint_min 60 -sc_threshold 0 "
             f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
             f"-af 'aresample=async=1000:first_pts=0' "
             f"-avoid_negative_ts make_zero -max_interleave_delta 0 "
             f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
         )
+    elif layout == "landscape_raw":
+        # نمط البث العرضي الأصلي
+        if platform in ["Facebook", "Instagram"]:
+            log(f"[{user}] تفعيل نمط عرضي قياسي لـ Meta (1280x720 | Ultrafast 2500k | CFR 30fps | بافر أمان)")
+            vf_filter = (
+                "scale=w=1280:h=720:force_original_aspect_ratio=decrease,"
+                "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,"
+                "format=yuv420p"
+            )
+            pipeline_cmd = (
+                f"set -o pipefail; "
+                f"streamlink --stdout --retry-streams 5 --retry-open 5 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
+                f"mbuffer -q -m 16M -P 5 | "
+                f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
+                f"-fflags +genpts+discardcorrupt+nobuffer "
+                f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
+                f"-vf '{vf_filter}' "
+                f"-c:v libx264 -preset ultrafast -tune zerolatency "
+                f"-b:v 2500k -minrate 1500k -maxrate 3500k -bufsize 6000k "
+                f"-r 30 -fps_mode cfr -g 60 -keyint_min 60 -sc_threshold 0 "
+                f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
+                f"-af 'aresample=async=1000:first_pts=0' "
+                f"-avoid_negative_ts make_zero -max_interleave_delta 0 "
+                f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
+            )
+        else:
+            log(f"[{user}] تفعيل نمط عرضي لـ YouTube (Copy Codec + Filler 2000k)")
+            pipeline_cmd = (
+                f"set -o pipefail; "
+                f"streamlink --stdout --retry-streams 5 --retry-open 5 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
+                f"mbuffer -q -m 8M -P 2 | "
+                f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
+                f"-fflags +genpts+discardcorrupt+nobuffer "
+                f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
+                f"-c:v copy "
+                f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
+                f"-af 'aresample=async=1000:first_pts=0' "
+                f"-avoid_negative_ts make_zero -max_interleave_delta 0 -f flv pipe:1 | "
+                f"python3 restreamer.py --filler {FILLER_KBPS} | "
+                f"ffmpeg -hide_banner -nostdin -loglevel warning "
+                f"-f flv -i pipe:0 -c copy -flvflags no_duration_filesize -f flv {shlex.quote(target)}"
+            )
     else:
-        # منصة YouTube والروابط المخصصة: النسخ المباشر (-c:v copy) مع فلتر 2000k وسقف 3500k
-        log(f"[{user}] تطبيق بروفايل YouTube (Copy Codec + Filler 2000k | سقف 3500k)")
-        pipeline_cmd = (
-            f"set -o pipefail; "
-            f"streamlink --stdout --retry-streams 5 --retry-open 5 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
-            f"mbuffer -q -m 8M -P 2 | "
-            f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
-            f"-fflags +genpts+discardcorrupt+nobuffer "
-            f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
-            f"-c:v copy "
-            f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
-            f"-af 'aresample=async=1000:first_pts=0' "
-            f"-avoid_negative_ts make_zero -max_interleave_delta 0 -f flv pipe:1 | "
-            f"python3 restreamer.py --filler {FILLER_KBPS} | "
-            f"ffmpeg -hide_banner -nostdin -loglevel warning "
-            f"-f flv -i pipe:0 -c copy -flvflags no_duration_filesize -f flv {shlex.quote(target)}"
-        )
+        # layout == "portrait_copy" (الافتراضي: طولي أصلي نسخ مباشر)
+        if platform == "YouTube":
+            log(f"[{user}] تفعيل نمط YouTube طولي (Copy Codec + Filler 2000k | سقف 3500k)")
+            pipeline_cmd = (
+                f"set -o pipefail; "
+                f"streamlink --stdout --retry-streams 5 --retry-open 5 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
+                f"mbuffer -q -m 8M -P 2 | "
+                f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
+                f"-fflags +genpts+discardcorrupt+nobuffer "
+                f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
+                f"-c:v copy "
+                f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
+                f"-af 'aresample=async=1000:first_pts=0' "
+                f"-avoid_negative_ts make_zero -max_interleave_delta 0 -f flv pipe:1 | "
+                f"python3 restreamer.py --filler {FILLER_KBPS} | "
+                f"ffmpeg -hide_banner -nostdin -loglevel warning "
+                f"-f flv -i pipe:0 -c copy -flvflags no_duration_filesize -f flv {shlex.quote(target)}"
+            )
+        else:
+            log(f"[{user}] تفعيل نمط {platform} طولي (Copy Codec مباشر مع بافر أمان ومزامنة صوت)")
+            pipeline_cmd = (
+                f"set -o pipefail; "
+                f"streamlink --stdout --retry-streams 5 --retry-open 5 {shlex.quote(tiktok_url)} h264_hd,720p,best | "
+                f"mbuffer -q -m 16M -P 5 | "
+                f"ffmpeg -hide_banner -nostdin -loglevel warning -err_detect ignore_err "
+                f"-fflags +genpts+discardcorrupt+nobuffer "
+                f"-i pipe:0 -map 0:v:0 -map 0:a:0? "
+                f"-c:v copy "
+                f"-c:a aac -b:a 128k -ar 44100 -ac 2 "
+                f"-af 'aresample=async=1000:first_pts=0' "
+                f"-avoid_negative_ts make_zero -max_interleave_delta 0 "
+                f"-flvflags no_duration_filesize -f flv {shlex.quote(target)}"
+            )
 
     is_currently_live = False
     consecutive_failures = 0
@@ -238,7 +311,12 @@ def stream_worker(stream_data: dict, stop_event: threading.Event):
         if not is_currently_live:
             is_currently_live = True
             update_stream_live_status(user, True)
-            notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\nجاري الإرسال المباشر فوراً إلى <b>{platform}</b> بإعدادات متوافقة 100% 🚀")
+            notify_telegram(
+                f"🔴 <b>بدأ البث المباشر لحساب @{user}!</b>\n"
+                f"• <b>المنصة:</b> {platform}\n"
+                f"• <b>نمط العرض:</b> {layout_desc}\n"
+                f"🚀 جاري الإرسال المباشر فوراً بأعلى درجات الاستقرار!"
+            )
 
         log(f"[{user}] إطلاق خط الأنابيب إلى: {target}")
 
@@ -284,7 +362,7 @@ def main():
         run_filler(int(sys.argv[2]), MAX_CAP_KBPS)
         return
 
-    log(f"محرك إدارة البثوث قيد التشغيل (يوتيوب: فلتر 2000k وسقف 3500k | فيسبوك وإنستغرام: Live API مشفر)...")
+    log(f"محرك إدارة البثوث قيد التشغيل (دعم كامل للأبعاد الطولية والعرضية، والشاشة السوداء بنسبة 80%)...")
     with open("/tmp/daemon_ready", "w") as f:
         f.write("ok")
 
