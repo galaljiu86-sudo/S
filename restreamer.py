@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import html
 import json
 import os
 import queue
@@ -85,7 +86,9 @@ MIN_RESERVE_SEC = 3.0
 STREAM_STALL_SECONDS = env_value("STREAM_STALL_SECONDS", 15.0, float)
 SOURCE_QUEUE_CHUNKS = env_value("SOURCE_QUEUE_CHUNKS", 16, int)
 OFFLINE_CONFIRMATIONS = env_value("OFFLINE_CONFIRMATIONS", 4, int)
-OFFLINE_CONFIRM_INTERVAL = env_value("OFFLINE_CONFIRM_INTERVAL", 2.5, float)
+OFFLINE_CONFIRM_INTERVAL = env_value("OFFLINE_CONFIRM_INTERVAL", 5.0, float)
+# لا يُغلق البث إلا إذا ظل TikTok يرجّع "لا يوجد بث" بشكل متواصل لهذه المدة (ثواني)
+OFFLINE_GRACE_SECONDS = env_value("OFFLINE_GRACE_SECONDS", 120.0, float)
 WS_OFFLINE_FAILSAFE_SECONDS = env_value("WS_OFFLINE_FAILSAFE_SECONDS", 120.0, float)
 
 TIKTOK_API_LOCK = threading.Lock()
@@ -780,6 +783,8 @@ class ChannelRelay:
         self.last_memory_cleanup = 0.0
         self.last_wait_log = 0.0
         self.last_status_error_log = 0.0
+        self.end_reason = ""
+        self.last_downstream_notify = -1e9
 
     def _rebuild_session_unlocked(self) -> None:
         old_session = self.session
@@ -790,17 +795,21 @@ class ChannelRelay:
         self.session = make_session()
         self.session_created_at = time.monotonic()
 
-    def fetch_source_streams(self):
+    def fetch_source_streams(self, priority: bool = False):
         global LAST_TIKTOK_API_CALL
         with self.session_lock:
             now = time.monotonic()
             if now - self.session_created_at >= SESSION_TTL_SEC:
                 self._rebuild_session_unlocked()
-            with TIKTOK_API_LOCK:
-                wait = MIN_TIKTOK_API_GAP - (time.monotonic() - LAST_TIKTOK_API_CALL)
-                if wait > 0:
-                    time.sleep(wait)
+            if priority:
+                # قناة شغالة لايف: لا تنتظر في طابور القنوات التانية
                 LAST_TIKTOK_API_CALL = time.monotonic()
+            else:
+                with TIKTOK_API_LOCK:
+                    wait = MIN_TIKTOK_API_GAP - (time.monotonic() - LAST_TIKTOK_API_CALL)
+                    if wait > 0:
+                        time.sleep(wait)
+                    LAST_TIKTOK_API_CALL = time.monotonic()
             try:
                 return self.session.streams(self.tiktok_url)
             except Exception as exc:
@@ -878,7 +887,30 @@ class ChannelRelay:
             except Exception:
                 pass
 
-    def on_live_ended(self) -> None:
+    def pipeline_error_tail(self, lines: int = 12) -> str:
+        try:
+            with open(f"/tmp/pipeline_err_{self.sid}.log", "r", encoding="utf-8", errors="replace") as f:
+                data = f.read()[-1500:].strip().splitlines()[-lines:]
+            return "\n".join(data)
+        except Exception:
+            return ""
+
+    def report_downstream_exit(self, code) -> None:
+        tail = self.pipeline_error_tail()
+        log(f"[{self.user}] [PROC] Downstream exited ({code}); restarting. ffmpeg stderr tail:\n{tail}")
+        now = time.monotonic()
+        if now - self.last_downstream_notify >= 120:
+            self.last_downstream_notify = now
+            detail = html.escape(tail[-600:]) if tail else "no details"
+            notify_telegram(
+                f"⚠️ <b>انقطع الإرسال إلى {self.platform} (@{self.user})</b>\n"
+                f"<pre>{detail}</pre>\nجاري إعادة الاتصال..."
+            )
+
+    def on_live_ended(self, reason: str = "") -> None:
+        if reason:
+            self.end_reason = reason
+            log(f"[{self.user}] [LIVE_END] {reason}")
         self.live_ended_event.set()
         with self.current_fd_lock:
             fd = self.current_fd
@@ -970,7 +1002,9 @@ class ChannelRelay:
                     self.stop_pipeline("TikTok LIVE ended")
                     pipeline_live = False
                     update_stream_live_status(self.sid, self.user, False)
-                    notify_telegram(f"⏹️ <b>انتهى البث المباشر لحساب @{self.user}.</b>\nتم إيقاف النقل إلى {self.platform}.")
+                    why = f"\n• <b>السبب:</b> {html.escape(self.end_reason)}" if self.end_reason else ""
+                    self.end_reason = ""
+                    notify_telegram(f"⏹️ <b>انتهى البث المباشر لحساب @{self.user}.</b>\nتم إيقاف النقل إلى {self.platform}.{why}")
                     self.flv_splicer = None
                     session_number = 0
                     offline_count = 0
@@ -979,12 +1013,12 @@ class ChannelRelay:
                     self.stop_event.wait(LIVE_END_COOLDOWN)
                     continue
 
-                streams = self.fetch_source_streams()
+                streams = self.fetch_source_streams(priority=pipeline_live)
 
                 if streams is None:
                     if pipeline_live and offline_since is not None:
-                        if self.ws_connected.is_set() and time.monotonic() - offline_since >= WS_OFFLINE_FAILSAFE_SECONDS:
-                            self.on_live_ended()
+                        if time.monotonic() - offline_since >= OFFLINE_GRACE_SECONDS:
+                            self.on_live_ended(f"تعذّر التحقق من TikTok وكان البث غير موجود لمدة {OFFLINE_GRACE_SECONDS:.0f} ثانية")
                             continue
                     self.stop_event.wait(RESTART_DELAY if pipeline_live else CHECK_INTERVAL)
                     continue
@@ -996,12 +1030,9 @@ class ChannelRelay:
                         continue
                     if offline_since is None:
                         offline_since = time.monotonic()
-                    offline_count += 1
-                    if not self.ws_connected.is_set() and offline_count >= OFFLINE_CONFIRMATIONS:
-                        self.on_live_ended()
-                        continue
-                    if self.ws_connected.is_set() and time.monotonic() - offline_since >= WS_OFFLINE_FAILSAFE_SECONDS:
-                        self.on_live_ended()
+                        log(f"[{self.user}] [CHECK] TikTok reports no stream; waiting up to {OFFLINE_GRACE_SECONDS:.0f}s before closing.")
+                    if time.monotonic() - offline_since >= OFFLINE_GRACE_SECONDS:
+                        self.on_live_ended(f"TikTok رجّع (لا يوجد بث) بشكل متواصل لمدة {OFFLINE_GRACE_SECONDS:.0f} ثانية")
                         continue
                     self.stop_event.wait(OFFLINE_CONFIRM_INTERVAL)
                     continue
@@ -1029,7 +1060,7 @@ class ChannelRelay:
                     notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{self.user}!</b>\n• <b>المنصة:</b> {self.platform}\n🚀 جاري الإرسال المستمر!")
 
                 if self.proc is not None and self.proc.poll() is not None:
-                    log(f"[{self.user}] [PROC] Downstream exited ({self.proc.returncode}); restarting.")
+                    self.report_downstream_exit(self.proc.returncode)
                     self.stop_pipeline("downstream exited")
                     pipeline_live = False
                     self.flv_splicer = None
@@ -1043,6 +1074,7 @@ class ChannelRelay:
                     continue
 
                 if self.proc is not None and self.proc.poll() is not None:
+                    self.report_downstream_exit(self.proc.returncode)
                     self.stop_pipeline("downstream exited")
                     pipeline_live = False
                     self.flv_splicer = None
@@ -1075,9 +1107,12 @@ def main() -> None:
         entry = workers.pop(sid, None)
         if not entry:
             return
-        entry["relay"].stop_event.set()
-        entry["relay"].on_live_ended()
-        entry["thread"].join(timeout=8)
+        try:
+            entry["relay"].stop_event.set()
+            entry["relay"].on_live_ended()
+            entry["thread"].join(timeout=8)
+        except Exception as exc:
+            log(f"[MAIN] stop_channel({sid}) error: {exc!r}")
 
     def handle_signal(_signum, _frame):
         SHUTDOWN_EVENT.set()
@@ -1089,45 +1124,50 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
 
     while not SHUTDOWN_EVENT.is_set():
-        if os.path.exists("/tmp/reload_restreamer"):
-            try:
-                os.remove("/tmp/reload_restreamer")
-            except OSError:
-                pass
+        try:
+            if os.path.exists("/tmp/reload_restreamer"):
+                try:
+                    os.remove("/tmp/reload_restreamer")
+                except OSError:
+                    pass
 
-        if os.path.exists("/tmp/restart_all_streams"):
-            try:
-                os.remove("/tmp/restart_all_streams")
-            except OSError:
-                pass
-            for sid in list(workers.keys()):
-                stop_channel(sid)
-
-        configured = load_streams()
-        active_map = {s["id"]: s for s in configured if s.get("enabled", True)}
-
-        for sid in list(workers.keys()):
-            if sid not in active_map:
-                stop_channel(sid)
-
-        for sid, sdata in active_map.items():
-            if sid in workers:
-                old = workers[sid]["relay"].data
-                if (
-                    old.get("target_url") != sdata.get("target_url")
-                    or old.get("layout") != sdata.get("layout")
-                    or old.get("platform") != sdata.get("platform")
-                ):
-                    log(f"🔄 تحديث بث @{sdata['tiktok_user']} دون المساس ببقية البثوث...")
+            if os.path.exists("/tmp/restart_all_streams"):
+                try:
+                    os.remove("/tmp/restart_all_streams")
+                except OSError:
+                    pass
+                for sid in list(workers.keys()):
                     stop_channel(sid)
 
-        for sid, sdata in active_map.items():
-            if sid not in workers or not workers[sid]["thread"].is_alive():
-                relay = ChannelRelay(sdata)
-                th = threading.Thread(target=relay.run, daemon=True, name=f"relay-{sid}")
-                th.start()
-                workers[sid] = {"relay": relay, "thread": th}
+            configured = load_streams()
+            active_map = {s["id"]: s for s in configured if s.get("enabled", True)}
 
+            for sid in list(workers.keys()):
+                if sid not in active_map:
+                    stop_channel(sid)
+
+            for sid, sdata in active_map.items():
+                if sid in workers:
+                    old = workers[sid]["relay"].data
+                    if (
+                        old.get("target_url") != sdata.get("target_url")
+                        or old.get("layout") != sdata.get("layout")
+                        or old.get("platform") != sdata.get("platform")
+                    ):
+                        log(f"🔄 تحديث بث @{sdata.get('tiktok_user')} دون المساس ببقية البثوث...")
+                        stop_channel(sid)
+
+            for sid, sdata in active_map.items():
+                if sid not in workers or not workers[sid]["thread"].is_alive():
+                    try:
+                        relay = ChannelRelay(sdata)
+                        th = threading.Thread(target=relay.run, daemon=True, name=f"relay-{sid}")
+                        th.start()
+                        workers[sid] = {"relay": relay, "thread": th}
+                    except Exception as exc:
+                        log(f"[MAIN] Could not start channel {sid} (other streams unaffected): {exc!r}")
+        except Exception as exc:
+            log(f"[MAIN] Supervisor error (running streams are not affected): {exc!r}")
         time.sleep(2)
 
 
