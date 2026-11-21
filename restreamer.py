@@ -674,11 +674,10 @@ def build_persistent_pipeline(target: str, platform: str, layout: str) -> str:
             "format=yuv420p"
         )
 
-    audio_options = (
-        ["-c:a", "copy"]
-        if (not is_meta and layout == "landscape_to_portrait_pad")
-        else ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
-    )
+    audio_options = ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
+    if not is_meta and layout == "landscape_to_portrait_pad":
+        # كان copy وده اللي بيقطّع الصوت: إعادة ترميز + aresample زي مسار الطولي (شغال 100%)
+        audio_options += ["-af", "aresample=async=1"]
 
     ffmpeg_reencode = [
         "nice", "-n", "10",
