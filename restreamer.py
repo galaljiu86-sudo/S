@@ -91,6 +91,11 @@ OFFLINE_CONFIRM_INTERVAL = env_value("OFFLINE_CONFIRM_INTERVAL", 5.0, float)
 OFFLINE_GRACE_SECONDS = env_value("OFFLINE_GRACE_SECONDS", 120.0, float)
 WS_OFFLINE_FAILSAFE_SECONDS = env_value("WS_OFFLINE_FAILSAFE_SECONDS", 120.0, float)
 
+# تأخير ثابت قبل الإرسال للمنصة (ثواني): بيمتص انقطاعات النت القصيرة عند صاحب البث
+DELAY_SECONDS = env_value("DELAY_SECONDS", 5.0, float)
+# حد أمان لحجم طابور التأخير في الذاكرة لكل بث (ميجا)
+DELAY_MAX_QUEUE_MB = env_value("DELAY_MAX_QUEUE_MB", 48, int)
+
 TIKTOK_API_LOCK = threading.Lock()
 LAST_TIKTOK_API_CALL = 0.0
 MIN_TIKTOK_API_GAP = 2.0
@@ -331,12 +336,72 @@ def h264_packet_has_idr(payload: bytes, nal_length_size: int) -> bool:
     return found
 
 
+class DelayLine:
+    """تأخير ثابت: كل tag بيتبعت وقت (timestamp + DELAY) على ساعة الجهاز."""
+
+    def __init__(self, write_bytes, delay_seconds: float):
+        self.write_bytes = write_bytes
+        self.delay = max(0.0, float(delay_seconds))
+        self.q: "queue.Queue" = queue.Queue()
+        self.queued_bytes = 0
+        self.max_bytes = max(4, DELAY_MAX_QUEUE_MB) * 1024 * 1024
+        self.anchor_wall: Optional[float] = None
+        self.anchor_ts: Optional[int] = None
+        self.failed = False
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="delay-line")
+        self.thread.start()
+
+    def put(self, ts: Optional[int], data: bytes) -> None:
+        if self.failed:
+            raise BrokenPipeError("delay line writer failed")
+        if self.queued_bytes > self.max_bytes:
+            self.failed = True
+            raise BrokenPipeError("delay line queue overflow (downstream too slow)")
+        self.queued_bytes += len(data)
+        self.q.put((ts, data))
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                ts, data = self.q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                if ts is not None:
+                    now = time.monotonic()
+                    if self.anchor_wall is None:
+                        self.anchor_wall = now + self.delay
+                        self.anchor_ts = ts
+                    wait = self.anchor_wall + (ts - self.anchor_ts) / 1000.0 - now
+                    if wait > 0 and self.stop_event.wait(wait):
+                        return
+                self.write_bytes(data)
+            except Exception:
+                self.failed = True
+                return
+            finally:
+                self.queued_bytes = max(0, self.queued_bytes - len(data))
+                self.q.task_done()
+
+    def close(self, flush: bool = False, timeout: float = 0.0) -> None:
+        if flush and not self.failed:
+            end = time.monotonic() + timeout
+            while self.q.unfinished_tasks > 0 and time.monotonic() < end and self.thread.is_alive():
+                time.sleep(0.1)
+        self.stop_event.set()
+
+
 class FlvSessionSplicer:
     def __init__(self, write_bytes):
         self.write_bytes = write_bytes
+        self.out = DelayLine(write_bytes, DELAY_SECONDS)
         self.header_written = False
         self.last_output_timestamp = -1
         self.session_count = 0
+
+    def close(self, flush: bool = False) -> None:
+        self.out.close(flush=flush, timeout=DELAY_SECONDS + 3)
 
     def process_handle(self, handle, source_name: str = "source") -> dict:
         flv_header = read_exact(handle, 9, "FLV header")
@@ -362,7 +427,7 @@ class FlvSessionSplicer:
                 break
 
         if not self.header_written:
-            self.write_bytes(flv_header + extra_header + previous0)
+            self.out.put(None, flv_header + extra_header + previous0)
             self.header_written = True
 
         if self.last_output_timestamp < 0:
@@ -428,7 +493,7 @@ class FlvSessionSplicer:
 
             output_timestamp = timestamp + timestamp_offset
             encoded = encode_flv_tag(tag_type, output_timestamp, stream_id, payload)
-            self.write_bytes(encoded)
+            self.out.put(output_timestamp, encoded)
             self.last_output_timestamp = max(self.last_output_timestamp, output_timestamp)
             last_session_ts = max(last_session_ts, output_timestamp)
 
@@ -886,6 +951,20 @@ class ChannelRelay:
             except Exception:
                 pass
 
+    def drop_splicer(self, flush: bool = False) -> None:
+        splicer = self.flv_splicer
+        self.flv_splicer = None
+        if splicer is not None:
+            try:
+                splicer.close(flush=flush)
+            except Exception:
+                pass
+
+    def pipeline_dead(self) -> bool:
+        if self.proc is not None and self.proc.poll() is not None:
+            return True
+        return self.flv_splicer is not None and self.flv_splicer.out.failed
+
     def pipeline_error_tail(self, lines: int = 12) -> str:
         try:
             with open(f"/tmp/pipeline_err_{self.sid}.log", "r", encoding="utf-8", errors="replace") as f:
@@ -898,9 +977,9 @@ class ChannelRelay:
         tail = self.pipeline_error_tail()
         log(f"[{self.user}] [PROC] Downstream exited ({code}); restarting. ffmpeg stderr tail:\n{tail}")
         now = time.monotonic()
-        if now - self.last_downstream_notify >= 120:
+        if now - self.last_downstream_notify >= 600:
             self.last_downstream_notify = now
-            detail = html.escape(tail[-600:]) if tail else "no details"
+            detail = html.escape(tail[-350:]) if tail else "no details"
             notify_telegram(
                 f"⚠️ <b>انقطع الإرسال إلى {self.platform} (@{self.user})</b>\n"
                 f"<pre>{detail}</pre>\nجاري إعادة الاتصال..."
@@ -992,19 +1071,21 @@ class ChannelRelay:
         session_number = 0
         offline_count = 0
         offline_since = None
+        announced = False
 
         try:
             while not self.stop_event.is_set() and not SHUTDOWN_EVENT.is_set():
                 self.maintain_memory()
 
                 if self.live_ended_event.is_set():
+                    self.drop_splicer(flush=True)
                     self.stop_pipeline("TikTok LIVE ended")
                     pipeline_live = False
+                    announced = False
                     update_stream_live_status(self.sid, self.user, False)
                     why = f"\n• <b>السبب:</b> {html.escape(self.end_reason)}" if self.end_reason else ""
                     self.end_reason = ""
                     notify_telegram(f"⏹️ <b>انتهى البث المباشر لحساب @{self.user}.</b>\nتم إيقاف النقل إلى {self.platform}.{why}")
-                    self.flv_splicer = None
                     session_number = 0
                     offline_count = 0
                     offline_since = None
@@ -1050,19 +1131,22 @@ class ChannelRelay:
                         self.start_pipeline()
                     except Exception as exc:
                         log(f"[{self.user}] [PROC] Failed to start pipeline: {exc}")
+                        self.drop_splicer()
                         self.stop_pipeline("startup failure")
                         self.stop_event.wait(CRASH_DELAY)
                         continue
                     pipeline_live = True
                     session_number = 0
                     update_stream_live_status(self.sid, self.user, True)
-                    notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{self.user}!</b>\n• <b>المنصة:</b> {self.platform}\n🚀 جاري الإرسال المستمر!")
+                    if not announced:
+                        announced = True
+                        notify_telegram(f"🔴 <b>بدأ البث المباشر لحساب @{self.user}!</b>\n• <b>المنصة:</b> {self.platform}\n🚀 جاري الإرسال المستمر!")
 
-                if self.proc is not None and self.proc.poll() is not None:
-                    self.report_downstream_exit(self.proc.returncode)
+                if self.pipeline_dead():
+                    self.report_downstream_exit(self.proc.returncode if self.proc is not None else None)
+                    self.drop_splicer()
                     self.stop_pipeline("downstream exited")
                     pipeline_live = False
-                    self.flv_splicer = None
                     self.stop_event.wait(CRASH_DELAY)
                     continue
 
@@ -1072,17 +1156,18 @@ class ChannelRelay:
                 if self.stop_event.is_set() or self.live_ended_event.is_set():
                     continue
 
-                if self.proc is not None and self.proc.poll() is not None:
-                    self.report_downstream_exit(self.proc.returncode)
+                if self.pipeline_dead():
+                    self.report_downstream_exit(self.proc.returncode if self.proc is not None else None)
+                    self.drop_splicer()
                     self.stop_pipeline("downstream exited")
                     pipeline_live = False
-                    self.flv_splicer = None
                     self.stop_event.wait(CRASH_DELAY)
                     continue
 
                 self.stop_event.wait(RESTART_DELAY)
         finally:
             self.on_live_ended()
+            self.drop_splicer()
             self.stop_pipeline("relay stopped")
             update_stream_live_status(self.sid, self.user, False)
 
