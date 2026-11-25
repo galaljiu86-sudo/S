@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.tmp
+*.lock
+.venv/
+data/*.log
+data/*.log.*
+data/status.json
+slate_*.flv
