@@ -154,4 +154,146 @@ jobs:
           mkdir -p data
           chmod +x start.sh
           rm -f /tmp/daemon_ready /tmp/bot_ready /tmp/supervisor_stop
-          setsid
+          setsid nohup $START_CMD > out.log 2>&1 &
+
+          ok=0
+          for i in $(seq 1 $(( READY_WAIT_SEC / 2 ))); do
+            if curl -sf --max-time 2 "http://127.0.0.1:9001/ready" > /dev/null 2>&1; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$ok" = 1 ]; then
+            echo "✅ الخدمة والبوت يعملان بنجاح، الجهاز جاهز (Port 9001)"
+          else
+            echo "❌ فشل بدء الخدمة، تفاصيل السجلات:"
+            cat out.log || true
+            tail -n 50 data/bot.log || true
+            tail -n 50 data/restreamer.log || true
+            exit 1
+          fi
+
+      - name: تسليم الراية للجهاز التالي (Pre-warmed Sub-Second Handoff)
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          PAT: ${{ secrets.PAT }}
+        run: |
+          elapsed() { echo $(( $(date +%s) - JOB_START )); }
+
+          peer_runs() {
+            for s in in_progress queued; do
+              curl -sf --max-time 10 -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$PEER_REPO/actions/runs?status=$s&per_page=1" | jq '.total_count // 0' 2>/dev/null || echo 0
+            done | awk '{n+=$1} END{print n+0}'
+          }
+
+          dispatch() {
+            curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$PEER_REPO/actions/workflows/$WORKFLOW_FILE/dispatches" \
+              -d "{\"ref\":\"$PEER_BRANCH\",\"inputs\":{\"receive\":\"true\"}}"
+          }
+
+          discover() {
+            sudo tailscale status --json | jq -r --arg n "$PEER_NAME" \
+              '[.Peer[]? | select(.Online==true) | select(.HostName|test("^"+$n+"(-[0-9]+)?$"))] | sort_by(.Created) | last | .TailscaleIPs[0] // empty'
+          }
+
+          wait=$(( HANDOFF_MIN*60 - $(elapsed) ))
+          [ "$wait" -gt 0 ] && sleep "$wait"
+
+          SENT=0; READY=0; LAST_DISPATCH=-9999
+          while [ "$(elapsed)" -lt $(( LAST_MIN*60 )) ]; do
+            IP=$(discover)
+
+            if [ -z "$IP" ]; then
+              SENT=0
+              if [ $(( $(elapsed) - LAST_DISPATCH )) -ge 300 ] && [ "$(peer_runs)" -eq 0 ]; then
+                echo "dispatch -> $(dispatch)"
+                LAST_DISPATCH=$(elapsed)
+              fi
+            fi
+
+            if [ -n "$IP" ] && [ "$SENT" = 0 ]; then
+              python3 - <<PY && { SENT=1; echo "✅ تم نقل إعدادات data بنجاح!"; } || true
+          import io, os, socket, tarfile
+          s = socket.socket()
+          s.settimeout(15)
+          try:
+              s.connect(("$IP", 9000))
+              buf = io.BytesIO()
+              with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                  for fname in ("data/streams.json", "data/global.json"):
+                      if os.path.isfile(fname):
+                          tar.add(fname)
+              s.sendall(buf.getvalue())
+              s.close()
+              print("SYNC_SUCCESS")
+          except Exception as exc:
+              print(f"SYNC_FAIL: {exc}")
+              raise SystemExit(1)
+          PY
+            fi
+
+            if [ -n "$IP" ] && curl -sf --max-time 5 "http://$IP:9001/ready" > /dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "$READY" = 1 ]; then
+            echo "🔄 مزامنة أحدث الإعدادات قبل التسليم الفوري..."
+            python3 - <<'PY' | curl -sf --max-time 5 -X POST -H "Content-Type: application/json" --data-binary @- "http://$IP:9001/sync" || true
+          import json, os
+          out = {}
+          if os.path.isfile("data/streams.json"):
+              with open("data/streams.json", "r", encoding="utf-8") as f:
+                  out["streams"] = json.load(f)
+          if os.path.isfile("data/global.json"):
+              with open("data/global.json", "r", encoding="utf-8") as f:
+                  out["global"] = json.load(f)
+          print(json.dumps(out, ensure_ascii=False))
+          PY
+
+            echo "⚡ إيقاف البث المحلي (بدون FCUnpublish) وتفعيل الجهاز التالي خلال أقل من ثانية..."
+            touch /tmp/supervisor_stop
+            pkill -TERM -f "python3.*bot\.py" || true
+            pkill -USR1 -f "python3.*restreamer\.py" || true
+            pkill -USR1 -f "start\.sh" || true
+            pkill -KILL -x ffmpeg || true
+            pkill -KILL -x mbuffer || true
+
+            for attempt in 1 2 3 4 5; do
+              if curl -sf --max-time 5 -X POST "http://$IP:9001/activate" > /dev/null 2>&1; then
+                echo "✅ تم التسليم والتفعيل الفوري بنجاح (المحاولة $attempt)!"
+                break
+              fi
+              sleep 0.5
+            done
+          else
+            echo "⚠️ تحذير: لم يستجب الجهاز الآخر، سيستمر العمل حتى الحد الأقصى."
+            rest=$(( 356*60 - $(elapsed) ))
+            [ "$rest" -gt 0 ] && sleep "$rest"
+          fi
+
+      - name: حفظ وتخزين بيانات البوت في المستودع احتياطياً
+        if: always() && steps.guard.outputs.skip != 'true'
+        env:
+          PAT: ${{ secrets.PAT }}
+        run: |
+          if [ -n "$PAT" ]; then
+            git config --global user.name "bot-sync"
+            git config --global user.email "bot@actions.local"
+            for f in data/streams.json data/global.json; do
+              [ -f "$f" ] && git add -f "$f"
+            done
+            if ! git diff --cached --quiet; then
+              git commit -m "Auto-backup bot config [skip ci]" || true
+              git push "https://${PAT}@github.com/${{ github.repository }}.git" HEAD:${{ github.ref_name }} || true
+              echo "✅ تم حفظ إعدادات البوت في المستودع احتياطياً بنجاح."
+            fi
+          fi
