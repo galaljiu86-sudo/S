@@ -19,7 +19,6 @@ env:
   START_CMD: "bash start.sh"
   HANDOFF_MIN: "280"
   LAST_MIN: "350"
-  OVERLAP_SEC: "1200"
   READY_WAIT_SEC: "180"
 
 jobs:
@@ -35,13 +34,25 @@ jobs:
           GHT: ${{ github.token }}
         run: |
           count() {
-            n=$(curl -sf -H "Authorization: Bearer $1" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$2/actions/runs?status=$3&per_page=1" | jq '.total_count // 0' 2>/dev/null)
-            echo "${n:-0}"
+            local tok="$1" repo="$2" status="$3" out
+            out=$(curl -sf --retry 3 --retry-delay 2 \
+              -H "Authorization: Bearer $tok" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$repo/actions/runs?status=$status&per_page=1" | jq -r '.total_count // "ERR"' 2>/dev/null) || out="ERR"
+            echo "$out"
           }
-          me=$(( $(count "$GHT" "${{ github.repository }}" in_progress) + $(count "$GHT" "${{ github.repository }}" queued) ))
-          peer=$(( $(count "$PAT" "$PEER_REPO" in_progress) + $(count "$PAT" "$PEER_REPO" queued) ))
-          echo "me=$me peer=$peer"
+          me_prog=$(count "$GHT" "${{ github.repository }}" in_progress)
+          me_q=$(count "$GHT" "${{ github.repository }}" queued)
+          peer_prog=$(count "$PAT" "$PEER_REPO" in_progress)
+          peer_q=$(count "$PAT" "$PEER_REPO" queued)
+          echo "me=($me_prog,$me_q) peer=($peer_prog,$peer_q)"
+          if [ "$me_prog" = "ERR" ] || [ "$me_q" = "ERR" ] || [ "$peer_prog" = "ERR" ] || [ "$peer_q" = "ERR" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "تعذّر التحقق من GitHub API بأمان، سيتم تخطي هذه الدورة."
+            exit 0
+          fi
+          me=$(( me_prog + me_q ))
+          peer=$(( peer_prog + peer_q ))
           if [ "$me" -gt 1 ] || [ "$peer" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "سلسلة أخرى نشطة حالياً، سيتم الخروج."
@@ -58,8 +69,11 @@ jobs:
         if: steps.guard.outputs.skip != 'true'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq ffmpeg mbuffer > /dev/null
-          pip3 install --no-cache-dir -r requirements.txt
+          sudo apt-get install -y -qq jq ffmpeg mbuffer python3-venv > /dev/null
+          python3 -m venv "$HOME/.venv"
+          "$HOME/.venv/bin/pip" install --no-cache-dir --upgrade pip -q
+          "$HOME/.venv/bin/pip" install --no-cache-dir -r requirements.txt
+          echo "$HOME/.venv/bin" >> "$GITHUB_PATH"
 
       - name: الاتصال بشبكة Tailscale (دائم لا ينتهي)
         if: steps.guard.outputs.skip != 'true'
@@ -76,32 +90,57 @@ jobs:
         if: steps.guard.outputs.skip != 'true' && github.event.inputs.receive == 'true'
         run: |
           mkdir -p data
+          rm -f /tmp/standby_mode
           echo "بانتظار وصول ملفات الداتا من الرانر القديم..."
-          python3 -c "
-          import socket, tarfile, io
+          python3 - <<'PY'
+          import io, json, os, shutil, socket, tarfile, tempfile
+
           s = socket.socket()
           s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-          s.bind(('0.0.0.0', 9000))
+          s.bind(("0.0.0.0", 9000))
           s.listen(1)
           s.settimeout(180)
-          print('Receiver listening on port 9000...')
+          print("Receiver listening on port 9000...")
+          received = False
           try:
               conn, addr = s.accept()
               buf = bytearray()
               while True:
                   chunk = conn.recv(65536)
-                  if not chunk: break
+                  if not chunk:
+                      break
                   buf.extend(chunk)
+                  if len(buf) > 10 * 1024 * 1024:
+                      raise ValueError("Payload too large")
               conn.close()
               if buf:
-                  tar = tarfile.open(fileobj=io.BytesIO(buf), mode='r:gz')
-                  tar.extractall('.')
-                  print('Data sync complete!')
-          except Exception as e:
-              print(f'Notice: {e}')
+                  with tempfile.TemporaryDirectory() as tmp:
+                      with tarfile.open(fileobj=io.BytesIO(buf), mode="r:gz") as tar:
+                          members = []
+                          for m in tar.getmembers():
+                              norm = os.path.normpath(m.name)
+                              if os.path.isabs(norm) or norm.startswith(".."):
+                                  continue
+                              if norm in ("data/streams.json", "data/global.json"):
+                                  members.append(m)
+                          tar.extractall(tmp, members=members)
+                      for fname in ("streams.json", "global.json"):
+                          src = os.path.join(tmp, "data", fname)
+                          if os.path.isfile(src):
+                              with open(src, "r", encoding="utf-8") as f:
+                                  json.load(f)
+                              shutil.copy2(src, os.path.join("data", fname))
+                  received = True
+                  print("Data sync complete!")
+          except Exception as exc:
+              print(f"Notice: {exc}")
           finally:
               s.close()
-          " || echo "استمرار..."
+
+          if received:
+              with open("/tmp/standby_mode", "w", encoding="utf-8") as f:
+                  f.write("1")
+          PY
           ls -la data
 
       - name: تشغيل الخدمة وإعلان الجاهزية
@@ -109,121 +148,10 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
           MY_NAME: ${{ env.MY_NAME }}
         run: |
           mkdir -p data
-          rm -f /tmp/daemon_ready
-          setsid nohup $START_CMD > out.log 2>&1 &
-
-          ok=0
-          for i in $(seq 1 $(( READY_WAIT_SEC / 2 ))); do
-            if [ -f /tmp/daemon_ready ]; then ok=1; break; fi
-            sleep 2
-          done
-
-          if [ "$ok" = 1 ]; then
-            mkdir -p /tmp/ready && echo ok > /tmp/ready/ready
-            setsid nohup python3 -m http.server 9001 --directory /tmp/ready > /dev/null 2>&1 &
-            echo "✅ الخدمة والبوت يعملان بنجاح، الجهاز جاهز"
-          else
-            echo "❌ فشل بدء الخدمة، تفاصيل out.log:"
-            cat out.log || true
-            exit 1
-          fi
-
-      - name: تسليم الراية للجهاز التالي (Handoff Relay مع تداخل ثلث ساعة)
-        if: steps.guard.outputs.skip != 'true'
-        env:
-          PAT: ${{ secrets.PAT }}
-        run: |
-          elapsed() { echo $(( $(date +%s) - JOB_START )); }
-
-          peer_runs() {
-            for s in in_progress queued; do
-              curl -s -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/$PEER_REPO/actions/runs?status=$s&per_page=1" | jq '.total_count // 0'
-            done | awk '{n+=$1} END{print n+0}'
-          }
-
-          dispatch() {
-            curl -s -o /dev/null -w "%{http_code}" -X POST \
-              -H "Authorization: Bearer $PAT" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$PEER_REPO/actions/workflows/$WORKFLOW_FILE/dispatches" \
-              -d "{\"ref\":\"$PEER_BRANCH\",\"inputs\":{\"receive\":\"true\"}}"
-          }
-
-          discover() {
-            sudo tailscale status --json | jq -r --arg n "$PEER_NAME" \
-              '[.Peer[]? | select(.Online==true) | select(.HostName|test("^"+$n+"(-[0-9]+)?$"))] | sort_by(.Created) | last | .TailscaleIPs[0] // empty'
-          }
-
-          wait=$(( HANDOFF_MIN*60 - $(elapsed) ))
-          [ "$wait" -gt 0 ] && sleep "$wait"
-
-          SENT=0; READY=0; LAST_DISPATCH=-9999
-          while [ "$(elapsed)" -lt $(( LAST_MIN*60 )) ]; do
-            IP=$(discover)
-
-            if [ -z "$IP" ]; then
-              SENT=0
-              if [ $(( $(elapsed) - LAST_DISPATCH )) -ge 300 ] && [ "$(peer_runs)" -eq 0 ]; then
-                echo "dispatch -> $(dispatch)"
-                LAST_DISPATCH=$(elapsed)
-              fi
-            fi
-
-            if [ -n "$IP" ] && [ "$SENT" = 0 ]; then
-              python3 -c "
-              import socket, tarfile, io, os
-              s = socket.socket()
-              s.settimeout(15)
-              try:
-                  s.connect(('$IP', 9000))
-                  buf = io.BytesIO()
-                  with tarfile.open(fileobj=buf, mode='w:gz') as tar:
-                      if os.path.exists('data'):
-                          tar.add('data')
-                  s.sendall(buf.getvalue())
-                  s.close()
-                  print('SYNC_SUCCESS')
-              except Exception as e:
-                  print(f'SYNC_FAIL: {e}')
-              " | grep -q 'SYNC_SUCCESS' && { SENT=1; echo "✅ تم نقل مجلد data بالكامل للجهاز الجديد بنجاح!"; }
-            fi
-
-            if [ -n "$IP" ] && curl -sf --max-time 5 "http://$IP:9001/ready" > /dev/null; then
-              READY=1; break
-            fi
-            sleep 10
-          done
-
-          if [ "$READY" = 1 ]; then
-            echo "الجهاز التالي بدأ وجاهز. بدء فترة التداخل المتزامن (${OVERLAP_SEC} ثانية / 20 دقيقة)..."
-            sleep "$OVERLAP_SEC"
-            pkill -f "$START_CMD" || true
-            pkill -f "python3 bot.py" || true
-            pkill -f "python3 restreamer.py" || true
-            pkill -x ffmpeg || true
-            echo "تم تسليم العمليات بنجاح بعد انقضاء الـ 20 دقيقة وإيقاف الجهاز الحالي."
-          else
-            echo "تحذير: لم يستجب الجهاز الآخر، سيستمر العمل حتى الحد الأقصى."
-            rest=$(( 356*60 - $(elapsed) ))
-            [ "$rest" -gt 0 ] && sleep "$rest"
-          fi
-
-      - name: حفظ وتخزين بيانات البوت في المستودع احتياطياً
-        if: always() && steps.guard.outputs.skip != 'true'
-        env:
-          PAT: ${{ secrets.PAT }}
-        run: |
-          if [ -d data ] && [ -n "$PAT" ]; then
-            git config --global user.name "bot-sync"
-            git config --global user.email "bot@actions.local"
-            git add data/
-            if ! git diff --cached --quiet; then
-              git commit -m "Auto-backup bot data [skip ci]" || true
-              git push "https://${PAT}@github.com/${{ github.repository }}.git" HEAD:${{ github.ref_name }} || true
-              echo "✅ تم حفظ الداتا في المستودع احتياطياً بنجاح."
-            fi
-          fi
+          chmod +x start.sh
+          rm -f /tmp/daemon_ready /tmp/bot_ready /tmp/supervisor_stop
+          setsid
